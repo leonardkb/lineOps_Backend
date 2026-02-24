@@ -1287,6 +1287,8 @@ const sewedResult = await client.query(
   [date]
 );
 const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
+// 👇 ADD THIS LOG
+console.log(`[DEBUG] Summary for ${date}: totalSewed = ${totalSewed}`);
 
     // 3) Total operators – distinct count
     const operatorsResult = await client.query(
