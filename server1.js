@@ -1255,13 +1255,10 @@ const requireSupervisor = (req, res, next) => {
  * GET /api/supervisor/summary?date=YYYY-MM-DD
  * Returns global totals for the selected date
  */
-app.get(
-  "/api/supervisor/summary",
-  authenticateToken,
-  requireSupervisor,
-  async (req, res) => {
-    const client = await pool.connect();
-    try {
+
+app.get("/api/supervisor/summary", authenticateToken, requireSupervisor, async (req, res) => {
+  const client = await pool.connect();
+  try {
     await setSchema(client);
 
     const { date } = req.query;
@@ -1279,26 +1276,30 @@ app.get(
     const totalTarget = parseFloat(targetResult.rows[0].total_target) || 0;
 
     // 2) Total sewed – per operator per line: max of operation totals, then sum across lines
-    // Replace the old totalSewed query with:
-const sewedResult = await client.query(
-  `SELECT COALESCE(SUM(line_min), 0) AS total_sewed
-   FROM (
-     SELECT 
-       lr.line_no,
-       MIN(COALESCE(op_total, 0)) AS line_min
-     FROM line_runs lr
-     JOIN run_operators ro ON lr.id = ro.run_id
-     JOIN operator_operations oo ON ro.id = oo.run_operator_id
-     LEFT JOIN (
-       SELECT operation_id, SUM(sewed_qty) AS op_total
-       FROM operation_sewed_entries
-       GROUP BY operation_id
-     ) se ON oo.id = se.operation_id
-     WHERE lr.run_date = $1
-     GROUP BY lr.line_no
-   ) line_totals`,
-  [date]
-);
+    const sewedResult = await client.query(
+      `SELECT COALESCE(SUM(operator_production), 0) AS total_sewed
+       FROM (
+         SELECT 
+           t.line_no,
+           t.operator_no,
+           MAX(COALESCE(t.op_total, 0)) AS operator_production
+         FROM (
+           SELECT 
+             lr.line_no,
+             ro.operator_no,
+             oo.id,
+             COALESCE(SUM(se.sewed_qty), 0) AS op_total
+           FROM line_runs lr
+           JOIN run_operators ro ON lr.id = ro.run_id
+           JOIN operator_operations oo ON ro.id = oo.run_operator_id
+           LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+           WHERE lr.run_date = $1
+           GROUP BY lr.line_no, ro.operator_no, oo.id
+         ) t
+         GROUP BY t.line_no, t.operator_no
+       ) ops`,
+      [date]
+    );
     const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
 
     // 3) Total operators – distinct count
@@ -1382,76 +1383,65 @@ const sewedResult = await client.query(
  * GET /api/supervisor/alert-count?date=YYYY-MM-DD
  * Returns count of operators with production alerts (variance > 10% or production zero)
  */
-app.get(
-  "/api/supervisor/alert-count",
-  authenticateToken,
-  requireSupervisor,
-  async (req, res) => {
-    const client = await pool.connect();
-    try {
-      await setSchema(client);
+app.get("/api/supervisor/alert-count", authenticateToken, requireSupervisor, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
 
-      const { date } = req.query;
-      if (!date) {
-        return res
-          .status(400)
-          .json({ success: false, error: "date parameter required" });
-      }
-
-      const alertQuery = `
-        WITH operator_planned AS (
-          SELECT 
-            ro.operator_no,
-            COALESCE(SUM(h.stitched_qty), 0) AS planned_total
-          FROM line_runs lr
-          JOIN run_operators ro ON lr.id = ro.run_id
-          JOIN operator_operations oo ON ro.id = oo.run_operator_id
-          LEFT JOIN operation_hourly_entries h ON oo.id = h.operation_id
-          WHERE lr.run_date = $1
-          GROUP BY ro.operator_no
-        ),
-        operator_actual AS (
-          SELECT 
-            ro.operator_no,
-            COALESCE(SUM(se.sewed_qty), 0) AS actual_total
-          FROM line_runs lr
-          JOIN run_operators ro ON lr.id = ro.run_id
-          JOIN operator_operations oo ON ro.id = oo.run_operator_id
-          LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-          WHERE lr.run_date = $1
-          GROUP BY ro.operator_no
-        )
-        SELECT COUNT(*) AS alert_count
-        FROM operator_planned p
-        JOIN operator_actual a ON p.operator_no = a.operator_no
-        WHERE a.actual_total < p.planned_total * 0.9
-           OR (p.planned_total > 0 AND a.actual_total = 0);
-      `;
-
-      const result = await client.query(alertQuery, [date]);
-      const alertCount = parseInt(result.rows[0].alert_count) || 0;
-
-      res.json({ success: true, date, alertCount });
-    } catch (err) {
-      console.error("❌ /api/supervisor/alert-count error:", err.message);
-      res.status(500).json({ success: false, error: err.message });
-    } finally {
-      client.release();
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter required" });
     }
+
+    const alertQuery = `
+      WITH operator_planned AS (
+        SELECT 
+          ro.operator_no,
+          COALESCE(SUM(h.stitched_qty), 0) AS planned_total
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_hourly_entries h ON oo.id = h.operation_id
+        WHERE lr.run_date = $1
+        GROUP BY ro.operator_no
+      ),
+      operator_actual AS (
+        SELECT 
+          ro.operator_no,
+          COALESCE(SUM(se.sewed_qty), 0) AS actual_total
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date = $1
+        GROUP BY ro.operator_no
+      )
+      SELECT COUNT(*) AS alert_count
+      FROM operator_planned p
+      JOIN operator_actual a ON p.operator_no = a.operator_no
+      WHERE a.actual_total < p.planned_total * 0.9
+         OR (p.planned_total > 0 AND a.actual_total = 0);
+    `;
+
+    const result = await client.query(alertQuery, [date]);
+    const alertCount = parseInt(result.rows[0].alert_count) || 0;
+
+    res.json({ success: true, date, alertCount });
+  } catch (err) {
+    console.error("❌ /api/supervisor/alert-count error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
   }
-);
+});
 
 /**
  * GET /api/supervisor/line-performance?date=YYYY-MM-DD
- * Returns per‑line: line_no, totalTarget, totalSewed, achievement, operators
+ * Returns per-line: line_no, totalTarget, totalSewed, achievement, operators
  */
-app.get(
-  "/api/supervisor/line-performance",
-  authenticateToken,
-  requireSupervisor,
-  async (req, res) => {
-    const client = await pool.connect();
-    try {
+app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor, async (req, res) => {
+  const client = await pool.connect();
+  try {
     await setSchema(client);
 
     const { date } = req.query;
@@ -1466,21 +1456,29 @@ app.get(
         WHERE run_date = $1
         GROUP BY line_no
       ),
-      line_operation_totals AS (
+      operator_production AS (
         SELECT 
-          lr.line_no,
-          oo.id AS operation_id,
-          COALESCE(SUM(se.sewed_qty), 0) AS op_total
-        FROM line_runs lr
-        JOIN run_operators ro ON lr.id = ro.run_id
-        JOIN operator_operations oo ON ro.id = oo.run_operator_id
-        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-        WHERE lr.run_date = $1
-        GROUP BY lr.line_no, oo.id
+          line_no,
+          operator_no,
+          MAX(COALESCE(op_total, 0)) AS operator_production
+        FROM (
+          SELECT 
+            lr.line_no,
+            ro.operator_no,
+            oo.id,
+            SUM(se.sewed_qty) AS op_total
+          FROM line_runs lr
+          JOIN run_operators ro ON lr.id = ro.run_id
+          JOIN operator_operations oo ON ro.id = oo.run_operator_id
+          LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+          WHERE lr.run_date = $1
+          GROUP BY lr.line_no, ro.operator_no, oo.id
+        ) t
+        GROUP BY line_no, operator_no
       ),
       line_sewed AS (
-        SELECT line_no, MIN(op_total) AS total_sewed
-        FROM line_operation_totals
+        SELECT line_no, SUM(operator_production) AS total_sewed
+        FROM operator_production
         GROUP BY line_no
       ),
       line_operators AS (
