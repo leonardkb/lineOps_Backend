@@ -1255,10 +1255,6 @@ const requireSupervisor = (req, res, next) => {
  * GET /api/supervisor/summary?date=YYYY-MM-DD
  * Returns global totals for the selected date
  */
-/**
- * GET /api/supervisor/summary?date=YYYY-MM-DD
- * Returns global totals for the selected date
- */
 app.get(
   "/api/supervisor/summary",
   authenticateToken,
@@ -1284,7 +1280,7 @@ app.get(
       );
       const totalTarget = parseFloat(targetResult.rows[0].total_target) || 0;
 
-      // 2) Total sewed – sum of per‑line minima (bottleneck)
+      // 2) Total sewed – sum of per‑line minima (bottleneck) for the selected date
       const sewedResult = await client.query(
         `SELECT COALESCE(SUM(line_min), 0) AS total_sewed
          FROM (
