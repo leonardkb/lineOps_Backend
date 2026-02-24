@@ -1275,32 +1275,18 @@ app.get("/api/supervisor/summary", authenticateToken, requireSupervisor, async (
     );
     const totalTarget = parseFloat(targetResult.rows[0].total_target) || 0;
 
-    // 2) Total sewed – per operator per line: max of operation totals, then sum across lines
-    const sewedResult = await client.query(
-      `SELECT COALESCE(SUM(operator_production), 0) AS total_sewed
-       FROM (
-         SELECT 
-           t.line_no,
-           t.operator_no,
-           MAX(COALESCE(t.op_total, 0)) AS operator_production
-         FROM (
-           SELECT 
-             lr.line_no,
-             ro.operator_no,
-             oo.id,
-             COALESCE(SUM(se.sewed_qty), 0) AS op_total
-           FROM line_runs lr
-           JOIN run_operators ro ON lr.id = ro.run_id
-           JOIN operator_operations oo ON ro.id = oo.run_operator_id
-           LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-           WHERE lr.run_date = $1
-           GROUP BY lr.line_no, ro.operator_no, oo.id
-         ) t
-         GROUP BY t.line_no, t.operator_no
-       ) ops`,
-      [date]
-    );
-    const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
+  // 2) Total sewed (finished garments) – sum of packing operation outputs
+const sewedResult = await client.query(
+  `SELECT COALESCE(SUM(se.sewed_qty), 0) AS total_sewed
+   FROM line_runs lr
+   JOIN run_operators ro ON lr.id = ro.run_id
+   JOIN operator_operations oo ON ro.id = oo.run_operator_id
+   JOIN operation_sewed_entries se ON oo.id = se.operation_id
+   WHERE lr.run_date = $1
+     AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')`,
+  [date]
+);
+const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
 
     // 3) Total operators – distinct count
     const operatorsResult = await client.query(
@@ -1441,7 +1427,7 @@ app.get("/api/supervisor/alert-count", authenticateToken, requireSupervisor, asy
  */
 app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor, async (req, res) => {
   const client = await pool.connect();
-  try {
+   try {
     await setSchema(client);
 
     const { date } = req.query;
@@ -1458,23 +1444,16 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
       ),
       operator_production AS (
         SELECT 
-          line_no,
-          operator_no,
-          MAX(COALESCE(op_total, 0)) AS operator_production
-        FROM (
-          SELECT 
-            lr.line_no,
-            ro.operator_no,
-            oo.id,
-            SUM(se.sewed_qty) AS op_total
-          FROM line_runs lr
-          JOIN run_operators ro ON lr.id = ro.run_id
-          JOIN operator_operations oo ON ro.id = oo.run_operator_id
-          LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-          WHERE lr.run_date = $1
-          GROUP BY lr.line_no, ro.operator_no, oo.id
-        ) t
-        GROUP BY line_no, operator_no
+          lr.line_no,
+          ro.operator_no,
+          COALESCE(SUM(se.sewed_qty), 0) AS operator_production
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date = $1
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+        GROUP BY lr.line_no, ro.operator_no
       ),
       line_sewed AS (
         SELECT line_no, SUM(operator_production) AS total_sewed
