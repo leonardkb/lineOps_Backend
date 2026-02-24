@@ -1255,6 +1255,10 @@ const requireSupervisor = (req, res, next) => {
  * GET /api/supervisor/summary?date=YYYY-MM-DD
  * Returns global totals for the selected date
  */
+/**
+ * GET /api/supervisor/summary?date=YYYY-MM-DD
+ * Returns global totals for the selected date
+ */
 app.get(
   "/api/supervisor/summary",
   authenticateToken,
@@ -1284,20 +1288,21 @@ app.get(
       const sewedResult = await client.query(
         `SELECT COALESCE(SUM(line_min), 0) AS total_sewed
          FROM (
-           SELECT 
-             lr.line_no,
-             MIN(COALESCE(op_total, 0)) AS line_min
-           FROM line_runs lr
-           JOIN run_operators ro ON lr.id = ro.run_id
-           JOIN operator_operations oo ON ro.id = oo.run_operator_id
-           LEFT JOIN (
-             SELECT operation_id, SUM(sewed_qty) AS op_total
-             FROM operation_sewed_entries
-             GROUP BY operation_id
-           ) se ON oo.id = se.operation_id
-           WHERE lr.run_date = $1
-           GROUP BY lr.line_no
-         ) line_totals`,
+           SELECT line_no, MIN(op_total) AS line_min
+           FROM (
+             SELECT 
+               lr.line_no,
+               oo.id,
+               COALESCE(SUM(se.sewed_qty), 0) AS op_total
+             FROM line_runs lr
+             JOIN run_operators ro ON lr.id = ro.run_id
+             JOIN operator_operations oo ON ro.id = oo.run_operator_id
+             LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+             WHERE lr.run_date = $1
+             GROUP BY lr.line_no, oo.id
+           ) op_totals
+           GROUP BY line_no
+         ) line_mins`,
         [date]
       );
       const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
