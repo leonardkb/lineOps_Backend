@@ -1262,125 +1262,121 @@ app.get(
   async (req, res) => {
     const client = await pool.connect();
     try {
-      await setSchema(client);
+    await setSchema(client);
 
-      const { date } = req.query;
-      if (!date) {
-        return res
-          .status(400)
-          .json({ success: false, error: "date parameter required" });
-      }
-
-      // 1) Total target – direct sum
-      const targetResult = await client.query(
-        `SELECT COALESCE(SUM(target_pcs), 0) as total_target
-         FROM line_runs
-         WHERE run_date = $1`,
-        [date]
-      );
-      const totalTarget = parseFloat(targetResult.rows[0].total_target) || 0;
-
-      // 2) Total sewed – sum of per‑line minima (bottleneck) for the selected date
-      const sewedResult = await client.query(
-        `SELECT COALESCE(SUM(line_min), 0) AS total_sewed
-         FROM (
-           SELECT line_no, MIN(op_total) AS line_min
-           FROM (
-             SELECT 
-               lr.line_no,
-               oo.id,
-               COALESCE(SUM(se.sewed_qty), 0) AS op_total
-             FROM line_runs lr
-             JOIN run_operators ro ON lr.id = ro.run_id
-             JOIN operator_operations oo ON ro.id = oo.run_operator_id
-             LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-             WHERE lr.run_date = $1
-             GROUP BY lr.line_no, oo.id
-           ) op_totals
-           GROUP BY line_no
-         ) line_mins`,
-        [date]
-      );
-      const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
-
-      // 3) Total operators – distinct count
-      const operatorsResult = await client.query(
-        `SELECT COUNT(DISTINCT ro.operator_no) as total_operators
-         FROM run_operators ro
-         JOIN line_runs lr ON ro.run_id = lr.id
-         WHERE lr.run_date = $1`,
-        [date]
-      );
-      const totalOperators = parseInt(operatorsResult.rows[0].total_operators) || 0;
-
-      // 4) Efficiency – using bottleneck per run (min pieces)
-      const efficiencyResult = await client.query(
-        `
-        WITH run_available_minutes AS (
-          SELECT 
-            id AS run_id,
-            (working_hours * operators_count * 60) AS available_minutes
-          FROM line_runs
-          WHERE run_date = $1
-        ),
-        run_operation_totals AS (
-          SELECT 
-            lr.id AS run_id,
-            lr.sam_minutes,
-            oo.id AS operation_id,
-            COALESCE(SUM(se.sewed_qty), 0) AS op_total
-          FROM line_runs lr
-          JOIN run_operators ro ON lr.id = ro.run_id
-          JOIN operator_operations oo ON ro.id = oo.run_operator_id
-          LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-          WHERE lr.run_date = $1
-          GROUP BY lr.id, lr.sam_minutes, oo.id
-        ),
-        run_min_pieces AS (
-          SELECT 
-            run_id,
-            sam_minutes,
-            MIN(op_total) AS min_pieces
-          FROM run_operation_totals
-          GROUP BY run_id, sam_minutes
-        )
-        SELECT 
-          COALESCE(SUM(ram.available_minutes), 0) AS total_available_minutes,
-          COALESCE(SUM(rmp.min_pieces * rmp.sam_minutes), 0) AS total_sam_output
-        FROM run_available_minutes ram
-        LEFT JOIN run_min_pieces rmp ON ram.run_id = rmp.run_id;
-        `,
-        [date]
-      );
-
-      const row = efficiencyResult.rows[0];
-      const totalSamOutput = parseFloat(row.total_sam_output) || 0;
-      const totalAvailableMinutes = parseFloat(row.total_available_minutes) || 0;
-      const overallEfficiency =
-        totalAvailableMinutes > 0 ? (totalSamOutput / totalAvailableMinutes) * 100 : 0;
-
-      // 5) Target achievement
-      const targetAchievement = totalTarget > 0 ? (totalSewed / totalTarget) * 100 : 0;
-
-      res.json({
-        success: true,
-        date,
-        summary: {
-          totalTarget: Math.round(totalTarget * 100) / 100,
-          totalSewed: Math.round(totalSewed * 100) / 100,
-          totalOperators,
-          targetAchievement: Math.round(targetAchievement * 100) / 100,
-          overallEfficiency: Math.round(overallEfficiency * 100) / 100,
-        },
-      });
-    } catch (err) {
-      console.error("❌ /api/supervisor/summary error:", err.message);
-      res.status(500).json({ success: false, error: err.message });
-    } finally {
-      client.release();
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter required" });
     }
-  }
+
+    // 1) Total target – direct sum
+    const targetResult = await client.query(
+      `SELECT COALESCE(SUM(target_pcs), 0) as total_target
+       FROM line_runs
+       WHERE run_date = $1`,
+      [date]
+    );
+    const totalTarget = parseFloat(targetResult.rows[0].total_target) || 0;
+
+    // 2) Total sewed – per operator per line: max of operation totals, then sum across lines
+    // Replace the old totalSewed query with:
+const sewedResult = await client.query(
+  `SELECT COALESCE(SUM(line_min), 0) AS total_sewed
+   FROM (
+     SELECT 
+       lr.line_no,
+       MIN(COALESCE(op_total, 0)) AS line_min
+     FROM line_runs lr
+     JOIN run_operators ro ON lr.id = ro.run_id
+     JOIN operator_operations oo ON ro.id = oo.run_operator_id
+     LEFT JOIN (
+       SELECT operation_id, SUM(sewed_qty) AS op_total
+       FROM operation_sewed_entries
+       GROUP BY operation_id
+     ) se ON oo.id = se.operation_id
+     WHERE lr.run_date = $1
+     GROUP BY lr.line_no
+   ) line_totals`,
+  [date]
 );
+    const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
+
+    // 3) Total operators – distinct count
+    const operatorsResult = await client.query(
+      `SELECT COUNT(DISTINCT ro.operator_no) as total_operators
+       FROM run_operators ro
+       JOIN line_runs lr ON ro.run_id = lr.id
+       WHERE lr.run_date = $1`,
+      [date]
+    );
+    const totalOperators = parseInt(operatorsResult.rows[0].total_operators) || 0;
+
+    // 4) Efficiency – using bottleneck per run (min pieces) to count garments correctly
+    const efficiencyResult = await client.query(
+      `
+      WITH run_available_minutes AS (
+        SELECT 
+          id AS run_id,
+          (working_hours * operators_count * 60) AS available_minutes
+        FROM line_runs
+        WHERE run_date = $1
+      ),
+      run_operation_totals AS (
+        SELECT 
+          lr.id AS run_id,
+          lr.sam_minutes,
+          oo.id AS operation_id,
+          COALESCE(SUM(se.sewed_qty), 0) AS op_total
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date = $1
+        GROUP BY lr.id, lr.sam_minutes, oo.id
+      ),
+      run_min_pieces AS (
+        SELECT 
+          run_id,
+          sam_minutes,
+          MIN(op_total) AS min_pieces   -- bottleneck determines completed garments
+        FROM run_operation_totals
+        GROUP BY run_id, sam_minutes
+      )
+      SELECT 
+        COALESCE(SUM(ram.available_minutes), 0) AS total_available_minutes,
+        COALESCE(SUM(rmp.min_pieces * rmp.sam_minutes), 0) AS total_sam_output
+      FROM run_available_minutes ram
+      LEFT JOIN run_min_pieces rmp ON ram.run_id = rmp.run_id;
+    `,
+      [date]
+    );
+
+    const row = efficiencyResult.rows[0];
+    const totalSamOutput = parseFloat(row.total_sam_output) || 0;
+    const totalAvailableMinutes = parseFloat(row.total_available_minutes) || 0;
+    const overallEfficiency = totalAvailableMinutes > 0 ? (totalSamOutput / totalAvailableMinutes) * 100 : 0;
+
+    // 5) Target achievement
+    const targetAchievement = totalTarget > 0 ? (totalSewed / totalTarget) * 100 : 0;
+
+    res.json({
+      success: true,
+      date,
+      summary: {
+        totalTarget: Math.round(totalTarget * 100) / 100,
+        totalSewed: Math.round(totalSewed * 100) / 100,
+        totalOperators,
+        targetAchievement: Math.round(targetAchievement * 100) / 100,
+        overallEfficiency: Math.round(overallEfficiency * 100) / 100,
+      },
+    });
+  } catch (err) {
+    console.error("❌ /api/supervisor/summary error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 /**
  * GET /api/supervisor/alert-count?date=YYYY-MM-DD
@@ -1456,81 +1452,78 @@ app.get(
   async (req, res) => {
     const client = await pool.connect();
     try {
-      await setSchema(client);
+    await setSchema(client);
 
-      const { date } = req.query;
-      if (!date) {
-        return res
-          .status(400)
-          .json({ success: false, error: "date parameter required" });
-      }
-
-      const query = `
-        WITH line_targets AS (
-          SELECT line_no, SUM(target_pcs) AS total_target
-          FROM line_runs
-          WHERE run_date = $1
-          GROUP BY line_no
-        ),
-        line_operation_totals AS (
-          SELECT 
-            lr.line_no,
-            oo.id AS operation_id,
-            COALESCE(SUM(se.sewed_qty), 0) AS op_total
-          FROM line_runs lr
-          JOIN run_operators ro ON lr.id = ro.run_id
-          JOIN operator_operations oo ON ro.id = oo.run_operator_id
-          LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-          WHERE lr.run_date = $1
-          GROUP BY lr.line_no, oo.id
-        ),
-        line_sewed AS (
-          SELECT line_no, MIN(op_total) AS total_sewed
-          FROM line_operation_totals
-          GROUP BY line_no
-        ),
-        line_operators AS (
-          SELECT lr.line_no, COUNT(DISTINCT ro.operator_no) AS operators_count
-          FROM line_runs lr
-          JOIN run_operators ro ON lr.id = ro.run_id
-          WHERE lr.run_date = $1
-          GROUP BY lr.line_no
-        )
-        SELECT 
-          lt.line_no,
-          lt.total_target,
-          COALESCE(ls.total_sewed, 0) AS total_sewed,
-          COALESCE(lo.operators_count, 0) AS operators_count,
-          CASE 
-            WHEN lt.total_target > 0 
-            THEN (COALESCE(ls.total_sewed, 0) / lt.total_target) * 100 
-            ELSE 0 
-          END AS achievement
-        FROM line_targets lt
-        LEFT JOIN line_sewed ls ON lt.line_no = ls.line_no
-        LEFT JOIN line_operators lo ON lt.line_no = lo.line_no
-        ORDER BY lt.line_no;
-      `;
-
-      const result = await client.query(query, [date]);
-
-      const lines = result.rows.map((row) => ({
-        lineNo: row.line_no,
-        totalTarget: parseFloat(row.total_target) || 0,
-        totalSewed: parseFloat(row.total_sewed) || 0,
-        operators: parseInt(row.operators_count) || 0,
-        achievement: Math.round((parseFloat(row.achievement) || 0) * 100) / 100,
-      }));
-
-      res.json({ success: true, date, lines });
-    } catch (err) {
-      console.error("❌ /api/supervisor/line-performance error:", err.message);
-      res.status(500).json({ success: false, error: err.message });
-    } finally {
-      client.release();
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter required" });
     }
+
+    const query = `
+      WITH line_targets AS (
+        SELECT line_no, SUM(target_pcs) AS total_target
+        FROM line_runs
+        WHERE run_date = $1
+        GROUP BY line_no
+      ),
+      line_operation_totals AS (
+        SELECT 
+          lr.line_no,
+          oo.id AS operation_id,
+          COALESCE(SUM(se.sewed_qty), 0) AS op_total
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date = $1
+        GROUP BY lr.line_no, oo.id
+      ),
+      line_sewed AS (
+        SELECT line_no, MIN(op_total) AS total_sewed
+        FROM line_operation_totals
+        GROUP BY line_no
+      ),
+      line_operators AS (
+        SELECT lr.line_no, COUNT(DISTINCT ro.operator_no) AS operators_count
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        WHERE lr.run_date = $1
+        GROUP BY lr.line_no
+      )
+      SELECT 
+        lt.line_no,
+        lt.total_target,
+        COALESCE(ls.total_sewed, 0) AS total_sewed,
+        COALESCE(lo.operators_count, 0) AS operators_count,
+        CASE 
+          WHEN lt.total_target > 0 
+          THEN (COALESCE(ls.total_sewed, 0) / lt.total_target) * 100 
+          ELSE 0 
+        END AS achievement
+      FROM line_targets lt
+      LEFT JOIN line_sewed ls ON lt.line_no = ls.line_no
+      LEFT JOIN line_operators lo ON lt.line_no = lo.line_no
+      ORDER BY lt.line_no;
+    `;
+
+    const result = await client.query(query, [date]);
+
+    const lines = result.rows.map((row) => ({
+      lineNo: row.line_no,
+      totalTarget: parseFloat(row.total_target) || 0,
+      totalSewed: parseFloat(row.total_sewed) || 0,
+      operators: parseInt(row.operators_count) || 0,
+      achievement: Math.round((parseFloat(row.achievement) || 0) * 100) / 100,
+    }));
+
+    res.json({ success: true, date, lines });
+  } catch (err) {
+    console.error("❌ /api/supervisor/line-performance error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
   }
-);
+});
 // ----------------------------------------------------------------------
 // 15. ENGINEER LINE BALANCING ENDPOINTS
 // ----------------------------------------------------------------------
