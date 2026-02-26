@@ -1237,6 +1237,150 @@ app.post(
   }
 );
 
+// ----------------------------------------------------------------------
+// 14. DUPLICATE RUN ENDPOINT (from server.js)
+// ----------------------------------------------------------------------
+app.post(
+  "/api/duplicate-run/:runId",
+  authenticateToken,
+  validate([
+    param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required"),
+    body("newDate").isDate().withMessage("Valid newDate (YYYY-MM-DD) required"),
+    body("newLineNo").optional().isString().withMessage("newLineNo must be a string if provided"),
+  ]),
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      await client.query("BEGIN");
+
+      const { runId } = req.params;
+      const { newDate } = req.body;            // required: YYYY-MM-DD
+      const newLineNo = req.body.newLineNo;    // optional – if omitted, same line_no is used
+
+      // 1. Get source run
+      const sourceRunRes = await client.query(
+        `SELECT line_no, style, operators_count, working_hours,
+                sam_minutes, efficiency, target_pcs, target_per_hour
+         FROM line_runs WHERE id = $1`,
+        [runId]
+      );
+      if (sourceRunRes.rowCount === 0) {
+        return res.status(404).json({ success: false, error: "Source run not found" });
+      }
+      const src = sourceRunRes.rows[0];
+
+      // 2. Insert new line_run
+      const newRunRes = await client.query(
+        `INSERT INTO line_runs
+           (line_no, run_date, style, operators_count, working_hours,
+            sam_minutes, efficiency, target_pcs, target_per_hour, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+         RETURNING id`,
+        [
+          newLineNo || src.line_no,
+          newDate,
+          src.style,
+          src.operators_count,
+          src.working_hours,
+          src.sam_minutes,
+          src.efficiency,
+          src.target_pcs,
+          src.target_per_hour,
+        ]
+      );
+      const newRunId = newRunRes.rows[0].id;
+
+      // 3. Copy shift_slots – store mapping old slot_id -> new slot_id
+      const slotMap = new Map(); // old slot_id -> new slot_id
+      const slotsRes = await client.query(
+        `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours
+         FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
+        [runId]
+      );
+      for (const slot of slotsRes.rows) {
+        const newSlotRes = await client.query(
+          `INSERT INTO shift_slots
+             (run_id, slot_order, slot_label, slot_start, slot_end, planned_hours)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id`,
+          [newRunId, slot.slot_order, slot.slot_label, slot.slot_start, slot.slot_end, slot.planned_hours]
+        );
+        slotMap.set(slot.id, newSlotRes.rows[0].id);
+      }
+
+      // 4. Copy run_operators – store mapping old operator_id -> new operator_id
+      const operatorMap = new Map();
+      const operatorsRes = await client.query(
+        `SELECT id, operator_no, operator_name FROM run_operators WHERE run_id = $1`,
+        [runId]
+      );
+      for (const op of operatorsRes.rows) {
+        const newOpRes = await client.query(
+          `INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
+           VALUES ($1, $2, $3, NOW())
+           RETURNING id`,
+          [newRunId, op.operator_no, op.operator_name]
+        );
+        operatorMap.set(op.id, newOpRes.rows[0].id);
+      }
+
+      // 5. Copy operator_operations (using operatorMap)
+      for (const [oldOpId, newOpId] of operatorMap.entries()) {
+        const opsRes = await client.query(
+          `SELECT operation_name, t1_sec, t2_sec, t3_sec, t4_sec, t5_sec, capacity_per_hour
+           FROM operator_operations WHERE run_operator_id = $1`,
+          [oldOpId]
+        );
+        for (const opData of opsRes.rows) {
+          await client.query(
+            `INSERT INTO operator_operations
+               (run_id, run_operator_id, operation_name, t1_sec, t2_sec, t3_sec, t4_sec, t5_sec,
+                capacity_per_hour, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+            [
+              newRunId,
+              newOpId,
+              opData.operation_name,
+              opData.t1_sec,
+              opData.t2_sec,
+              opData.t3_sec,
+              opData.t4_sec,
+              opData.t5_sec,
+              opData.capacity_per_hour,
+            ]
+          );
+        }
+      }
+
+      // 6. Copy slot_targets (using slotMap)
+      const targetsRes = await client.query(
+        `SELECT slot_id, slot_target, cumulative_target
+         FROM slot_targets WHERE run_id = $1`,
+        [runId]
+      );
+      for (const tgt of targetsRes.rows) {
+        const newSlotId = slotMap.get(tgt.slot_id);
+        if (newSlotId) {
+          await client.query(
+            `INSERT INTO slot_targets (run_id, slot_id, slot_target, cumulative_target, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW())`,
+            [newRunId, newSlotId, tgt.slot_target, tgt.cumulative_target]
+          );
+        }
+      }
+
+      await client.query("COMMIT");
+      res.json({ success: true, newRunId });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      next(err);
+    } finally {
+      client.release();
+    }
+  }
+);
+
 // --------------------------------------------------------------
 // SUPERVISOR DASHBOARD ENDPOINTS (FIXED)
 // --------------------------------------------------------------
