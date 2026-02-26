@@ -1573,7 +1573,7 @@ app.get("/api/supervisor/alert-count", authenticateToken, requireSupervisor, asy
  */
 app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor, async (req, res) => {
   const client = await pool.connect();
-   try {
+  try {
     await setSchema(client);
 
     const { date } = req.query;
@@ -1581,11 +1581,42 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
       return res.status(400).json({ success: false, error: "date parameter required" });
     }
 
+    // Use the server's current time – for a production system you might pass the client's time
+    const now = new Date();
+
     const query = `
       WITH line_targets AS (
-        SELECT line_no, SUM(target_pcs) AS total_target
-        FROM line_runs
-        WHERE run_date = $1
+        SELECT lr.id AS run_id, lr.line_no, lr.target_pcs AS total_target
+        FROM line_runs lr
+        WHERE lr.run_date = $1
+      ),
+      line_slots AS (
+        SELECT
+          lt.line_no,
+          ss.slot_start,
+          ss.slot_end,
+          st.slot_target
+        FROM line_targets lt
+        JOIN shift_slots ss ON lt.run_id = ss.run_id
+        LEFT JOIN slot_targets st ON ss.id = st.slot_id
+        WHERE ss.slot_start IS NOT NULL AND ss.slot_end IS NOT NULL
+      ),
+      line_realtime AS (
+        SELECT
+          line_no,
+          SUM(
+            CASE
+              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_end)::timestamp) THEN slot_target
+              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_start)::timestamp)
+                   AND $2::timestamp AT TIME ZONE 'UTC' < (($1 || ' ' || slot_end)::timestamp)
+              THEN slot_target * (
+                EXTRACT(EPOCH FROM ($2::timestamp AT TIME ZONE 'UTC' - ($1 || ' ' || slot_start)::timestamp)) /
+                EXTRACT(EPOCH FROM (($1 || ' ' || slot_end)::timestamp - ($1 || ' ' || slot_start)::timestamp))
+              )
+              ELSE 0
+            END
+          ) AS realtime_target
+        FROM line_slots
         GROUP BY line_no
       ),
       operator_production AS (
@@ -1618,6 +1649,7 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
         lt.total_target,
         COALESCE(ls.total_sewed, 0) AS total_sewed,
         COALESCE(lo.operators_count, 0) AS operators_count,
+        COALESCE(lr.realtime_target, 0) AS realtime_target,
         CASE 
           WHEN lt.total_target > 0 
           THEN (COALESCE(ls.total_sewed, 0) / lt.total_target) * 100 
@@ -1626,16 +1658,18 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
       FROM line_targets lt
       LEFT JOIN line_sewed ls ON lt.line_no = ls.line_no
       LEFT JOIN line_operators lo ON lt.line_no = lo.line_no
+      LEFT JOIN line_realtime lr ON lt.line_no = lr.line_no
       ORDER BY lt.line_no;
     `;
 
-    const result = await client.query(query, [date]);
+    const result = await client.query(query, [date, now]);
 
     const lines = result.rows.map((row) => ({
       lineNo: row.line_no,
       totalTarget: parseFloat(row.total_target) || 0,
       totalSewed: parseFloat(row.total_sewed) || 0,
       operators: parseInt(row.operators_count) || 0,
+      realtimeTarget: Math.round(parseFloat(row.realtime_target) * 100) / 100, // two decimals
       achievement: Math.round((parseFloat(row.achievement) || 0) * 100) / 100,
     }));
 
