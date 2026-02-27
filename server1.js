@@ -1574,21 +1574,20 @@ app.get("/api/supervisor/alert-count", authenticateToken, requireSupervisor, asy
  * GET /api/supervisor/line-performance?date=YYYY-MM-DD
  * Returns per-line: line_no, totalTarget, totalSewed, achievement, operators
  */
+
 app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
 
-    // DEBUG: verify session time zone and current database time
-    const tzRes = await client.query("SHOW TIME ZONE");
-    console.log("Session time zone:", tzRes.rows[0].TimeZone);
-    const nowRes = await client.query("SELECT now()");
-    console.log("Database now():", nowRes.rows[0].now);
-
     const { date } = req.query;
     if (!date) {
       return res.status(400).json({ success: false, error: "date parameter required" });
     }
+
+    // Current time in the server's timezone (you may want to use client time later)
+    const now = new Date();
+    const todayStr = date; // YYYY-MM-DD
 
     const query = `
       WITH line_targets AS (
@@ -1596,6 +1595,7 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
         FROM line_runs lr
         WHERE lr.run_date = $1
       ),
+      -- Get all slots with their targets for each line
       line_slots AS (
         SELECT
           lt.line_no,
@@ -1607,18 +1607,18 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
         LEFT JOIN slot_targets st ON ss.id = st.slot_id
         WHERE ss.slot_start IS NOT NULL AND ss.slot_end IS NOT NULL
       ),
+      -- Compute real‑time cumulative for each line
       line_realtime AS (
         SELECT
           line_no,
           SUM(
             CASE
-              -- Use explicit time zone 'America/Mexico_City' for all constructed timestamps
-              WHEN now() >= (($1 || ' ' || slot_end)::timestamp AT TIME ZONE 'America/Mexico_City') THEN slot_target
-              WHEN now() >= (($1 || ' ' || slot_start)::timestamp AT TIME ZONE 'America/Mexico_City')
-                   AND now() < (($1 || ' ' || slot_end)::timestamp AT TIME ZONE 'America/Mexico_City')
+              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_end)::timestamp) THEN slot_target
+              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_start)::timestamp)
+                   AND $2::timestamp AT TIME ZONE 'UTC' < (($1 || ' ' || slot_end)::timestamp)
               THEN slot_target * (
-                EXTRACT(EPOCH FROM (now() - (($1 || ' ' || slot_start)::timestamp AT TIME ZONE 'America/Mexico_City'))) /
-                EXTRACT(EPOCH FROM ((($1 || ' ' || slot_end)::timestamp AT TIME ZONE 'America/Mexico_City') - (($1 || ' ' || slot_start)::timestamp AT TIME ZONE 'America/Mexico_City')))
+                EXTRACT(EPOCH FROM ($2::timestamp AT TIME ZONE 'UTC' - ($1 || ' ' || slot_start)::timestamp)) /
+                EXTRACT(EPOCH FROM (($1 || ' ' || slot_end)::timestamp - ($1 || ' ' || slot_start)::timestamp))
               )
               ELSE 0
             END
@@ -1669,15 +1669,14 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
       ORDER BY lt.line_no;
     `;
 
-    const result = await client.query(query, [date]);
-    console.log('Query result:', result.rows);
+    const result = await client.query(query, [date, now]);
 
     const lines = result.rows.map((row) => ({
       lineNo: row.line_no,
       totalTarget: parseFloat(row.total_target) || 0,
       totalSewed: parseFloat(row.total_sewed) || 0,
       operators: parseInt(row.operators_count) || 0,
-      realtimeTarget: Math.round(parseFloat(row.realtime_target) * 100) / 100,
+      realtimeTarget: Math.round(parseFloat(row.realtime_target) * 100) / 100, // two decimals
       achievement: Math.round((parseFloat(row.achievement) || 0) * 100) / 100,
     }));
 
@@ -1689,6 +1688,121 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
     client.release();
   }
 });
+
+app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter required" });
+    }
+
+    // Current time in the server's timezone (you may want to use client time later)
+    const now = new Date();
+    const todayStr = date; // YYYY-MM-DD
+
+    const query = `
+      WITH line_targets AS (
+        SELECT lr.id AS run_id, lr.line_no, lr.target_pcs AS total_target
+        FROM line_runs lr
+        WHERE lr.run_date = $1
+      ),
+      -- Get all slots with their targets for each line
+      line_slots AS (
+        SELECT
+          lt.line_no,
+          ss.slot_start,
+          ss.slot_end,
+          st.slot_target
+        FROM line_targets lt
+        JOIN shift_slots ss ON lt.run_id = ss.run_id
+        LEFT JOIN slot_targets st ON ss.id = st.slot_id
+        WHERE ss.slot_start IS NOT NULL AND ss.slot_end IS NOT NULL
+      ),
+      -- Compute real‑time cumulative for each line
+      line_realtime AS (
+        SELECT
+          line_no,
+          SUM(
+            CASE
+              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_end)::timestamp) THEN slot_target
+              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_start)::timestamp)
+                   AND $2::timestamp AT TIME ZONE 'UTC' < (($1 || ' ' || slot_end)::timestamp)
+              THEN slot_target * (
+                EXTRACT(EPOCH FROM ($2::timestamp AT TIME ZONE 'UTC' - ($1 || ' ' || slot_start)::timestamp)) /
+                EXTRACT(EPOCH FROM (($1 || ' ' || slot_end)::timestamp - ($1 || ' ' || slot_start)::timestamp))
+              )
+              ELSE 0
+            END
+          ) AS realtime_target
+        FROM line_slots
+        GROUP BY line_no
+      ),
+      operator_production AS (
+        SELECT 
+          lr.line_no,
+          ro.operator_no,
+          COALESCE(SUM(se.sewed_qty), 0) AS operator_production
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date = $1
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+        GROUP BY lr.line_no, ro.operator_no
+      ),
+      line_sewed AS (
+        SELECT line_no, SUM(operator_production) AS total_sewed
+        FROM operator_production
+        GROUP BY line_no
+      ),
+      line_operators AS (
+        SELECT lr.line_no, COUNT(DISTINCT ro.operator_no) AS operators_count
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        WHERE lr.run_date = $1
+        GROUP BY lr.line_no
+      )
+      SELECT 
+        lt.line_no,
+        lt.total_target,
+        COALESCE(ls.total_sewed, 0) AS total_sewed,
+        COALESCE(lo.operators_count, 0) AS operators_count,
+        COALESCE(lr.realtime_target, 0) AS realtime_target,
+        CASE 
+          WHEN lt.total_target > 0 
+          THEN (COALESCE(ls.total_sewed, 0) / lt.total_target) * 100 
+          ELSE 0 
+        END AS achievement
+      FROM line_targets lt
+      LEFT JOIN line_sewed ls ON lt.line_no = ls.line_no
+      LEFT JOIN line_operators lo ON lt.line_no = lo.line_no
+      LEFT JOIN line_realtime lr ON lt.line_no = lr.line_no
+      ORDER BY lt.line_no;
+    `;
+
+    const result = await client.query(query, [date, now]);
+
+    const lines = result.rows.map((row) => ({
+      lineNo: row.line_no,
+      totalTarget: parseFloat(row.total_target) || 0,
+      totalSewed: parseFloat(row.total_sewed) || 0,
+      operators: parseInt(row.operators_count) || 0,
+      realtimeTarget: Math.round(parseFloat(row.realtime_target) * 100) / 100, // two decimals
+      achievement: Math.round((parseFloat(row.achievement) || 0) * 100) / 100,
+    }));
+
+    res.json({ success: true, date, lines });
+  } catch (err) {
+    console.error("❌ /api/supervisor/line-performance error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ----------------------------------------------------------------------
 // 15. ENGINEER LINE BALANCING ENDPOINTS
 // ----------------------------------------------------------------------
