@@ -114,7 +114,7 @@ pool.on("error", (err) => {
 const setSchema = async (client) => {
   await client.query("SET search_path TO prod_db_schema");
    // Set time zone to factory local (default Mexico City)
-  const timeZone = process.env.TIME_ZONE || 'America/Mexico_City';
+  const timeZone = 'America/Mexico_City';
   await client.query(`SET TIME ZONE '${timeZone}'`);
 };
 
@@ -1579,6 +1579,12 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
   try {
     await setSchema(client);
 
+    // DEBUG: verify session time zone and current database time
+    const tzRes = await client.query("SHOW TIME ZONE");
+    console.log("Session time zone:", tzRes.rows[0].TimeZone);
+    const nowRes = await client.query("SELECT now()");
+    console.log("Database now():", nowRes.rows[0].now);
+
     const { date } = req.query;
     if (!date) {
       return res.status(400).json({ success: false, error: "date parameter required" });
@@ -1606,12 +1612,13 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
           line_no,
           SUM(
             CASE
-              WHEN now() >= (($1 || ' ' || slot_end)::timestamptz) THEN slot_target
-              WHEN now() >= (($1 || ' ' || slot_start)::timestamptz)
-                   AND now() < (($1 || ' ' || slot_end)::timestamptz)
+              -- Use explicit time zone 'America/Mexico_City' for all constructed timestamps
+              WHEN now() >= (($1 || ' ' || slot_end)::timestamp AT TIME ZONE 'America/Mexico_City') THEN slot_target
+              WHEN now() >= (($1 || ' ' || slot_start)::timestamp AT TIME ZONE 'America/Mexico_City')
+                   AND now() < (($1 || ' ' || slot_end)::timestamp AT TIME ZONE 'America/Mexico_City')
               THEN slot_target * (
-                EXTRACT(EPOCH FROM (now() - (($1 || ' ' || slot_start)::timestamptz))) /
-                EXTRACT(EPOCH FROM ((($1 || ' ' || slot_end)::timestamptz) - (($1 || ' ' || slot_start)::timestamptz)))
+                EXTRACT(EPOCH FROM (now() - (($1 || ' ' || slot_start)::timestamp AT TIME ZONE 'America/Mexico_City'))) /
+                EXTRACT(EPOCH FROM ((($1 || ' ' || slot_end)::timestamp AT TIME ZONE 'America/Mexico_City') - (($1 || ' ' || slot_start)::timestamp AT TIME ZONE 'America/Mexico_City')))
               )
               ELSE 0
             END
@@ -1663,6 +1670,7 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
     `;
 
     const result = await client.query(query, [date]);
+    console.log('Query result:', result.rows);
 
     const lines = result.rows.map((row) => ({
       lineNo: row.line_no,
