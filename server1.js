@@ -113,6 +113,9 @@ pool.on("error", (err) => {
 
 const setSchema = async (client) => {
   await client.query("SET search_path TO prod_db_schema");
+   // Set time zone to factory local (default Mexico City)
+  const timeZone = process.env.TIME_ZONE || 'America/Mexico_City';
+  await client.query(`SET TIME ZONE '${timeZone}'`);
 };
 
 // ----------------------------------------------------------------------
@@ -1581,9 +1584,6 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
       return res.status(400).json({ success: false, error: "date parameter required" });
     }
 
-    // Use the server's current time – for a production system you might pass the client's time
-    const now = new Date();
-
     const query = `
       WITH line_targets AS (
         SELECT lr.id AS run_id, lr.line_no, lr.target_pcs AS total_target
@@ -1606,12 +1606,12 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
           line_no,
           SUM(
             CASE
-              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_end)::timestamp) THEN slot_target
-              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_start)::timestamp)
-                   AND $2::timestamp AT TIME ZONE 'UTC' < (($1 || ' ' || slot_end)::timestamp)
+              WHEN now() >= (($1 || ' ' || slot_end)::timestamptz) THEN slot_target
+              WHEN now() >= (($1 || ' ' || slot_start)::timestamptz)
+                   AND now() < (($1 || ' ' || slot_end)::timestamptz)
               THEN slot_target * (
-                EXTRACT(EPOCH FROM ($2::timestamp AT TIME ZONE 'UTC' - ($1 || ' ' || slot_start)::timestamp)) /
-                EXTRACT(EPOCH FROM (($1 || ' ' || slot_end)::timestamp - ($1 || ' ' || slot_start)::timestamp))
+                EXTRACT(EPOCH FROM (now() - (($1 || ' ' || slot_start)::timestamptz))) /
+                EXTRACT(EPOCH FROM ((($1 || ' ' || slot_end)::timestamptz) - (($1 || ' ' || slot_start)::timestamptz)))
               )
               ELSE 0
             END
@@ -1662,14 +1662,14 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
       ORDER BY lt.line_no;
     `;
 
-    const result = await client.query(query, [date, now]);
+    const result = await client.query(query, [date]);
 
     const lines = result.rows.map((row) => ({
       lineNo: row.line_no,
       totalTarget: parseFloat(row.total_target) || 0,
       totalSewed: parseFloat(row.total_sewed) || 0,
       operators: parseInt(row.operators_count) || 0,
-      realtimeTarget: Math.round(parseFloat(row.realtime_target) * 100) / 100, // two decimals
+      realtimeTarget: Math.round(parseFloat(row.realtime_target) * 100) / 100,
       achievement: Math.round((parseFloat(row.achievement) || 0) * 100) / 100,
     }));
 
