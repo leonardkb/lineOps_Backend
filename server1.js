@@ -1240,6 +1240,8 @@ app.post(
   }
 );
 
+
+
 // ----------------------------------------------------------------------
 // 14. DUPLICATE RUN ENDPOINT (from server.js)
 // ----------------------------------------------------------------------
@@ -1448,44 +1450,37 @@ console.log(`[DEBUG] Summary for ${date}: totalSewed = ${totalSewed}`);
     const totalOperators = parseInt(operatorsResult.rows[0].total_operators) || 0;
 
     // 4) Efficiency – using bottleneck per run (min pieces) to count garments correctly
-    const efficiencyResult = await client.query(
-      `
-      WITH run_available_minutes AS (
-        SELECT 
-          id AS run_id,
-          (working_hours * operators_count * 60) AS available_minutes
-        FROM line_runs
-        WHERE run_date = $1
-      ),
-      run_operation_totals AS (
-        SELECT 
-          lr.id AS run_id,
-          lr.sam_minutes,
-          oo.id AS operation_id,
-          COALESCE(SUM(se.sewed_qty), 0) AS op_total
-        FROM line_runs lr
-        JOIN run_operators ro ON lr.id = ro.run_id
-        JOIN operator_operations oo ON ro.id = oo.run_operator_id
-        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-        WHERE lr.run_date = $1
-        GROUP BY lr.id, lr.sam_minutes, oo.id
-      ),
-      run_min_pieces AS (
-        SELECT 
-          run_id,
-          sam_minutes,
-          MIN(op_total) AS min_pieces   -- bottleneck determines completed garments
-        FROM run_operation_totals
-        GROUP BY run_id, sam_minutes
-      )
-      SELECT 
-        COALESCE(SUM(ram.available_minutes), 0) AS total_available_minutes,
-        COALESCE(SUM(rmp.min_pieces * rmp.sam_minutes), 0) AS total_sam_output
-      FROM run_available_minutes ram
-      LEFT JOIN run_min_pieces rmp ON ram.run_id = rmp.run_id;
-    `,
-      [date]
-    );
+      // 4) Efficiency – using packing output (finished garments) to count total SAM produced
+const efficiencyResult = await client.query(
+  `
+  WITH run_available_minutes AS (
+    SELECT
+      id AS run_id,
+      (working_hours * operators_count * 60) AS available_minutes
+    FROM line_runs
+    WHERE run_date = $1
+  ),
+  run_packing_totals AS (
+    SELECT
+      lr.id AS run_id,
+      lr.sam_minutes,
+      COALESCE(SUM(se.sewed_qty), 0) AS packing_total
+    FROM line_runs lr
+    JOIN run_operators ro ON lr.id = ro.run_id
+    JOIN operator_operations oo ON ro.id = oo.run_operator_id
+    LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+    WHERE lr.run_date = $1
+      AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+    GROUP BY lr.id, lr.sam_minutes
+  )
+  SELECT
+    COALESCE(SUM(ram.available_minutes), 0) AS total_available_minutes,
+    COALESCE(SUM(rpt.packing_total * rpt.sam_minutes), 0) AS total_sam_output
+  FROM run_available_minutes ram
+  LEFT JOIN run_packing_totals rpt ON ram.run_id = rpt.run_id;
+`,
+  [date]
+);
 
     const row = efficiencyResult.rows[0];
     const totalSamOutput = parseFloat(row.total_sam_output) || 0;
