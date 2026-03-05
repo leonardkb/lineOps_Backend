@@ -281,6 +281,26 @@ const runMigrations = async () => {
     `);
     logger.info("✅ line_balancing_assignments table ready");
 
+        // 7. Add to createAllTables function after other table creations
+await client.query(`
+  CREATE TABLE IF NOT EXISTS operator_capacity_history (
+    id BIGSERIAL PRIMARY KEY,
+    operation_id BIGINT NOT NULL REFERENCES operator_operations(id) ON DELETE CASCADE,
+    old_capacity NUMERIC(12,3) NOT NULL,
+    new_capacity NUMERIC(12,3) NOT NULL,
+    changed_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_capacity_positive CHECK (new_capacity >= 0)
+  );
+`);
+console.log("✅ operator_capacity_history table ready in prod_db_schema");
+
+
+
+    // Create index for faster queries
+    await client.query("CREATE INDEX IF NOT EXISTS idx_capacity_history_operation ON operator_capacity_history(operation_id);");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_capacity_history_changed_at ON operator_capacity_history(changed_at);");
+
     // Indexes
     await client.query("CREATE INDEX IF NOT EXISTS idx_sewed_run ON operation_sewed_entries(run_id);");
     await client.query("CREATE INDEX IF NOT EXISTS idx_sewed_slot ON operation_sewed_entries(slot_id);");
@@ -1385,6 +1405,202 @@ app.post(
     }
   }
 );
+
+// --------------------------------------------------------------
+// update the operator capacity ENDPOINTS
+// --------------------------------------------------------------
+
+app.put("/api/update-operation/:runId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { runId } = req.params;
+    const { operatorNo, operationName, t1, t2, t3, t4, t5, capacityPerHour } = req.body;
+
+    if (!operatorNo || !operationName) {
+      return res.status(400).json({
+        success: false,
+        error: "Operator number and operation name are required",
+      });
+    }
+
+    // Find the operation ID and get current capacity
+    const opResult = await client.query(
+      `
+      SELECT o.id as op_id, o.capacity_per_hour as old_capacity
+      FROM operator_operations o
+      JOIN run_operators ro ON o.run_operator_id = ro.id
+      WHERE o.run_id = $1 
+        AND ro.operator_no = $2 
+        AND o.operation_name = $3
+      LIMIT 1
+      `,
+      [runId, parseInt(operatorNo), operationName]
+    );
+
+    if (opResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Operation not found",
+      });
+    }
+
+    const operationId = opResult.rows[0].op_id;
+    const oldCapacity = parseFloat(opResult.rows[0].old_capacity) || 0;
+    const newCapacity = capacityPerHour || 0;
+
+    // Update the operation - REMOVED updated_at reference
+    const updateResult = await client.query(
+      `
+      UPDATE operator_operations
+      SET 
+        t1_sec = $1,
+        t2_sec = $2,
+        t3_sec = $3,
+        t4_sec = $4,
+        t5_sec = $5,
+        capacity_per_hour = $6
+      WHERE id = $7
+      RETURNING id
+      `,
+      [
+        t1 || null,
+        t2 || null,
+        t3 || null,
+        t4 || null,
+        t5 || null,
+        newCapacity,
+        operationId,
+      ]
+    );
+
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Failed to update operation",
+      });
+    }
+
+    // Save to history table if capacity changed
+    if (Math.abs(oldCapacity - newCapacity) > 0.001) {
+      await client.query(
+        `
+        INSERT INTO operator_capacity_history 
+          (operation_id, old_capacity, new_capacity, changed_by, changed_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        `,
+        [operationId, oldCapacity, newCapacity, req.user.id]
+      );
+      console.log(`✅ Capacity history recorded for operation ${operationId}: ${oldCapacity} → ${newCapacity}`);
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      message: "Operation updated successfully",
+      operationId: updateResult.rows[0].id,
+      capacityChanged: Math.abs(oldCapacity - newCapacity) > 0.001
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error updating operation:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ Get capacity history for an operation
+app.get("/api/operation-capacity-history/:operationId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { operationId } = req.params;
+    
+    const result = await client.query(
+      `
+      SELECT 
+        h.id,
+        h.old_capacity,
+        h.new_capacity,
+        h.changed_at,
+        u.username as changed_by_username,
+        u.full_name as changed_by_name
+      FROM operator_capacity_history h
+      LEFT JOIN users u ON h.changed_by = u.id
+      WHERE h.operation_id = $1
+      ORDER BY h.changed_at DESC
+      `,
+      [operationId]
+    );
+    
+    res.json({
+      success: true,
+      history: result.rows
+    });
+  } catch (err) {
+    console.error("❌ Error fetching capacity history:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ Get all capacity changes for a run
+app.get("/api/run-capacity-history/:runId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { runId } = req.params;
+    
+    const result = await client.query(
+      `
+      SELECT 
+        h.id,
+        h.old_capacity,
+        h.new_capacity,
+        h.changed_at,
+        u.username as changed_by_username,
+        u.full_name as changed_by_name,
+        ro.operator_no,
+        ro.operator_name,
+        oo.operation_name
+      FROM operator_capacity_history h
+      JOIN operator_operations oo ON h.operation_id = oo.id
+      JOIN run_operators ro ON oo.run_operator_id = ro.id
+      LEFT JOIN users u ON h.changed_by = u.id
+      WHERE oo.run_id = $1
+      ORDER BY h.changed_at DESC
+      `,
+      [runId]
+    );
+    
+    res.json({
+      success: true,
+      history: result.rows
+    });
+  } catch (err) {
+    console.error("❌ Error fetching run capacity history:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
 
 // --------------------------------------------------------------
 // SUPERVISOR DASHBOARD ENDPOINTS (FIXED)
