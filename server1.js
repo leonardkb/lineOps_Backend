@@ -76,7 +76,7 @@ app.use(
 // ----------------------------------------------------------------------
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 100,
   message: { success: false, error: "Too many authentication attempts, please try again later." },
   standardHeaders: true,
   legacyHeaders: false,
@@ -84,7 +84,7 @@ const authLimiter = rateLimit({
 
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 100,
+  max: 300,
   message: { success: false, error: "Too many requests, please slow down." },
   standardHeaders: true,
   legacyHeaders: false,
@@ -101,7 +101,7 @@ const pool = new Pool({
   user: process.env.PG_USER,
   password: process.env.PG_PASSWORD,
   ssl: false, // adjust for production if needed
-  max: Number(process.env.PG_POOL_MAX) || 20,
+  max: Number(process.env.PG_POOL_MAX) || 50,
   idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT) || 30000,
   connectionTimeoutMillis: Number(process.env.PG_CONNECTION_TIMEOUT) || 5000,
 });
