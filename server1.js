@@ -1405,6 +1405,219 @@ app.post(
     }
   }
 );
+// ----------------------------------------------------------------------
+// 14.5 OPERATOR MANAGEMENT ENDPOINTS (add/delete operators)
+// ----------------------------------------------------------------------
+
+/**
+ * POST /api/run/:runId/operators
+ * Add a new operator to an existing run
+ */
+app.post(
+  "/api/run/:runId/operators",
+  authenticateToken,
+  allowRoles("engineer", "supervisor"),
+  validate([
+    param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required"),
+    body("operatorNo").isInt({ gt: 0 }).withMessage("Operator number must be a positive integer"),
+    body("operatorName").optional().isString().trim().withMessage("Operator name must be a string"),
+  ]),
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      await client.query("BEGIN");
+
+      const { runId } = req.params;
+      const { operatorNo, operatorName } = req.body;
+
+      // Check if operator already exists in this run
+      const existingOp = await client.query(
+        `SELECT id FROM run_operators 
+         WHERE run_id = $1 AND operator_no = $2`,
+        [runId, parseInt(operatorNo, 10)]
+      );
+
+      if (existingOp.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: `Operator ${operatorNo} already exists in this run`,
+        });
+      }
+
+      // Insert new operator
+      const result = await client.query(
+        `INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
+         VALUES ($1, $2, $3, NOW())
+         RETURNING id, operator_no, operator_name`,
+        [runId, parseInt(operatorNo, 10), operatorName || null]
+      );
+
+      await client.query("COMMIT");
+
+      logger.info("Operator added to run", { 
+        runId, 
+        operatorNo, 
+        operatorId: result.rows[0].id,
+        addedBy: req.user.username 
+      });
+
+      res.json({
+        success: true,
+        message: `Operator ${operatorNo} added successfully`,
+        operator: result.rows[0],
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      next(err);
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/**
+ * DELETE /api/run/:runId/operators/:operatorId
+ * Delete an operator from an existing run (cascades to operations and hourly entries)
+ */
+app.delete(
+  "/api/run/:runId/operators/:operatorId",
+  authenticateToken,
+  allowRoles("engineer", "supervisor"),
+  validate([
+    param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required"),
+    param("operatorId").isInt({ gt: 0 }).withMessage("Valid operator ID required"),
+  ]),
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      await client.query("BEGIN");
+
+      const { runId, operatorId } = req.params;
+
+      // Check if operator exists and belongs to this run
+      const operatorCheck = await client.query(
+        `SELECT id, operator_no FROM run_operators 
+         WHERE id = $1 AND run_id = $2`,
+        [operatorId, runId]
+      );
+
+      if (operatorCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          success: false,
+          error: "Operator not found in this run",
+        });
+      }
+
+      const operatorNo = operatorCheck.rows[0].operator_no;
+
+      // Delete operator (cascades to operations and hourly entries due to foreign keys)
+      await client.query(
+        `DELETE FROM run_operators WHERE id = $1`,
+        [operatorId]
+      );
+
+      await client.query("COMMIT");
+
+      logger.info("Operator deleted from run", { 
+        runId, 
+        operatorNo, 
+        operatorId,
+        deletedBy: req.user.username 
+      });
+
+      res.json({
+        success: true,
+        message: `Operator ${operatorNo} deleted successfully`,
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      next(err);
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/**
+ * GET /api/run/:runId/operators
+ * Get all operators for a run with their operations count
+ */
+app.get(
+  "/api/run/:runId/operators",
+  authenticateToken,
+  validate([
+    param("runId").isInt({ gt: 0 }).withMessage("Valid run ID required"),
+  ]),
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+
+      const { runId } = req.params;
+
+      // First verify the run exists
+      const runCheck = await client.query(
+        "SELECT id FROM line_runs WHERE id = $1",
+        [runId]
+      );
+
+      if (runCheck.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: "Run not found",
+        });
+      }
+
+      // For line leaders, verify they can only access their own line
+      if (req.user.role === "line_leader") {
+        const lineCheck = await client.query(
+          "SELECT line_no FROM line_runs WHERE id = $1",
+          [runId]
+        );
+        if (lineCheck.rows.length > 0 && 
+            String(lineCheck.rows[0].line_no) !== String(req.user.line_number)) {
+          logger.warn("Line leader attempted to access another line's operators", {
+            user: req.user.username,
+            requestedRun: runId,
+            userLine: req.user.line_number,
+          });
+          return res.status(403).json({
+            success: false,
+            error: "You can only access your own line's operators",
+          });
+        }
+      }
+
+      const result = await client.query(
+        `SELECT 
+          ro.id,
+          ro.operator_no,
+          ro.operator_name,
+          ro.created_at,
+          COUNT(oo.id) as operations_count
+         FROM run_operators ro
+         LEFT JOIN operator_operations oo ON ro.id = oo.run_operator_id
+         WHERE ro.run_id = $1
+         GROUP BY ro.id
+         ORDER BY ro.operator_no`,
+        [runId]
+      );
+
+      res.json({
+        success: true,
+        operators: result.rows,
+      });
+    } catch (err) {
+      next(err);
+    } finally {
+      client.release();
+    }
+  }
+);
 
 // --------------------------------------------------------------
 // update the operator capacity ENDPOINTS
