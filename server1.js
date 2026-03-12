@@ -155,7 +155,7 @@ const runMigrations = async () => {
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CONSTRAINT chk_role CHECK (role IN ('engineer', 'line_leader', 'supervisor')),
+        CONSTRAINT chk_role CHECK (role IN ('engineer', 'line_leader', 'supervisor','soporte_it', 'skyrina')),
         CONSTRAINT chk_line_number CHECK (line_number IS NULL OR (line_number >= 1 AND line_number <= 26))
       );
     `);
@@ -334,6 +334,8 @@ const seedDefaultUsers = async (client) => {
   const defaultUsers = [
     { username: "engineer", password: "engineer", role: "engineer", full_name: "System Engineer" },
     { username: "supervisor", password: "supervisor123", role: "supervisor", full_name: "Production Supervisor" },
+    { username: "soporte_it", password: "soporte_it123", role: "soporte_it", full_name: "IT Support" },
+    { username: "skyrina", password: "skyrina123", role: "skyrina", full_name: "Skyrina" },
   ];
   for (let i = 1; i <= 26; i++) {
     defaultUsers.push({
@@ -1820,10 +1822,10 @@ app.get("/api/run-capacity-history/:runId", authenticateToken, async (req, res) 
 // --------------------------------------------------------------
 
 const requireSupervisor = (req, res, next) => {
-  if (req.user.role !== "supervisor") {
+  if (req.user.role !== "supervisor" && req.user.role !== "soporte_it" && req.user.role !== "skyrina") {
     return res.status(403).json({
       success: false,
-      error: "Access denied. Supervisor role required.",
+      error: "Access denied. Supervisor, IT Support, or Skyrina role required.",
     });
   }
   next();
@@ -2425,7 +2427,7 @@ app.get("/api/supervisor/assignments", authenticateToken, requireSupervisor, asy
 // ----------------------------------------------------------------------
 // 18. USER MANAGEMENT
 // ----------------------------------------------------------------------
-app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor"), async (req, res, next) => {
+app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor", "soporte_it", "skyrina"), async (req, res, next) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
@@ -2433,7 +2435,7 @@ app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor"), a
       `SELECT id, username, role, line_number, full_name, is_active, created_at, updated_at
        FROM users
        ORDER BY
-         CASE role WHEN 'engineer' THEN 1 WHEN 'supervisor' THEN 2 WHEN 'line_leader' THEN 3 ELSE 4 END,
+         CASE role WHEN 'engineer' THEN 1 WHEN 'supervisor' THEN 2 WHEN 'line_leader' THEN 3 WHEN 'soporte_it' THEN 4 WHEN 'skyrina' THEN 5 ELSE 6 END,
          line_number NULLS FIRST,
          username`
     );
@@ -2452,7 +2454,7 @@ app.post(
   validate([
     body("username").notEmpty().withMessage("Username required"),
     body("password").isLength({ min: 8 }).withMessage("Password must be at least 8 characters"),
-    body("role").isIn(["engineer", "line_leader", "supervisor"]).withMessage("Invalid role"),
+    body("role").isIn(["engineer", "line_leader", "supervisor", "soporte_it", "skyrina"]).withMessage("Invalid role"),
     body("line_number").if(body("role").equals("line_leader")).isInt({ min: 1, max: 26 }).withMessage("Line number 1-26 required for line leader"),
   ]),
   async (req, res, next) => {

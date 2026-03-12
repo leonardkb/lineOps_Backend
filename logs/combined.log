@@ -408,3 +408,21 @@
 {"body":{"capacity_per_hour":65},"errors":[{"undefined":"Valid operation ID required"}],"level":"warn","message":"Validation error","service":"production-backend","timestamp":"2026-02-27T18:20:27.542Z"}
 {"level":"info","message":"::1 - - [27/Feb/2026:18:20:27 +0000] \"PATCH /api/operations/db_368/capacity HTTP/1.1\" 400 101 \"http://localhost:5173/\" \"Mozilla/5.0 (Linux; Android 8.1.0; SM-T837A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36\"","service":"production-backend","timestamp":"2026-02-27T18:20:27.544Z"}
 {"level":"info","message":"SIGINT received, closing server...","service":"production-backend","timestamp":"2026-02-27T18:21:58.388Z"}
+{"level":"info","message":"🚀 Server listening on port 5000","service":"production-backend","timestamp":"2026-03-12T18:33:20.163Z"}
+{"level":"info","message":"📁 Schema: prod_db_schema","service":"production-backend","timestamp":"2026-03-12T18:33:20.164Z"}
+{"level":"info","message":"🗄️  Database: prod_db","service":"production-backend","timestamp":"2026-03-12T18:33:20.165Z"}
+{"level":"info","message":"🔄 Running database migrations in prod_db_schema...","service":"production-backend","timestamp":"2026-03-12T18:33:20.196Z"}
+{"level":"info","message":"✅ line_balancing_assignments table ready","service":"production-backend","timestamp":"2026-03-12T18:33:20.250Z"}
+{"level":"info","message":"✅ All tables and indexes created successfully","service":"production-backend","timestamp":"2026-03-12T18:33:20.304Z"}
+{"level":"info","message":"✅ Default users seeded.","service":"production-backend","timestamp":"2026-03-12T18:33:21.801Z"}
+{"level":"info","message":"✅ Migrations completed successfully.","service":"production-backend","timestamp":"2026-03-12T18:33:21.804Z"}
+{"level":"info","message":"SIGINT received, closing server...","service":"production-backend","timestamp":"2026-03-12T18:33:46.904Z"}
+{"level":"info","message":"🚀 Server listening on port 5000","service":"production-backend","timestamp":"2026-03-12T18:33:50.518Z"}
+{"level":"info","message":"📁 Schema: prod_db_schema","service":"production-backend","timestamp":"2026-03-12T18:33:50.519Z"}
+{"level":"info","message":"🗄️  Database: prod_db","service":"production-backend","timestamp":"2026-03-12T18:33:50.519Z"}
+{"level":"info","message":"🔄 Running database migrations in prod_db_schema...","service":"production-backend","timestamp":"2026-03-12T18:33:50.541Z"}
+{"level":"info","message":"✅ line_balancing_assignments table ready","service":"production-backend","timestamp":"2026-03-12T18:33:50.581Z"}
+{"level":"info","message":"✅ All tables and indexes created successfully","service":"production-backend","timestamp":"2026-03-12T18:33:50.631Z"}
+{"level":"info","message":"✅ Default users seeded.","service":"production-backend","timestamp":"2026-03-12T18:33:52.116Z"}
+{"level":"info","message":"✅ Migrations completed successfully.","service":"production-backend","timestamp":"2026-03-12T18:33:52.122Z"}
+{"level":"info","message":"SIGINT received, closing server...","service":"production-backend","timestamp":"2026-03-12T18:34:10.630Z"}
