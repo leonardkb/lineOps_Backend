@@ -1621,6 +1621,114 @@ app.get(
   }
 );
 
+
+// --------------------------------------------------------------
+// update-working-hours (FIXED)
+// --------------------------------------------------------------
+
+// ✅ Update working hours for a run and recalculate target
+app.put("/api/update-working-hours/:runId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { runId } = req.params;
+    const { workingHours } = req.body;
+
+    if (!workingHours || workingHours <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Valid working hours are required",
+      });
+    }
+
+    // Get current run data
+    const runResult = await client.query(
+      `SELECT operators_count, sam_minutes, efficiency, target_pcs, target_per_hour
+       FROM line_runs WHERE id = $1`,
+      [runId]
+    );
+
+    if (runResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Run not found",
+      });
+    }
+
+    const run = runResult.rows[0];
+    
+    // Recalculate target based on new working hours
+    const operators = parseFloat(run.operators_count) || 0;
+    const sam = parseFloat(run.sam_minutes) || 0;
+    const efficiency = parseFloat(run.efficiency) || 0.7;
+    const wh = parseFloat(workingHours);
+
+    // Calculate new target
+    const totalMinutes = operators * wh * 60;
+    const piecesAt100 = sam > 0 ? totalMinutes / sam : 0;
+    const newTarget = piecesAt100 * efficiency;
+    
+    // Calculate new target per hour
+    const newTargetPerHour = wh > 0 ? newTarget / wh : 0;
+
+    // Update the run with new working hours and recalculated targets
+    await client.query(
+      `UPDATE line_runs 
+       SET working_hours = $1, 
+           target_pcs = $2,
+           target_per_hour = $3,
+           updated_at = NOW()
+       WHERE id = $4`,
+      [wh, newTarget, newTargetPerHour, runId]
+    );
+
+    // Also update slot targets (redistribute target across slots proportionally)
+    const slotsResult = await client.query(
+      `SELECT id, planned_hours FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
+      [runId]
+    );
+
+    if (slotsResult.rows.length > 0) {
+      const totalPlannedHours = slotsResult.rows.reduce((sum, slot) => sum + parseFloat(slot.planned_hours), 0);
+      
+      let cumulativeTarget = 0;
+      for (const slot of slotsResult.rows) {
+        const slotHours = parseFloat(slot.planned_hours);
+        const slotTarget = totalPlannedHours > 0 ? (slotHours / totalPlannedHours) * newTarget : 0;
+        cumulativeTarget += slotTarget;
+
+        await client.query(
+          `UPDATE slot_targets 
+           SET slot_target = $1, cumulative_target = $2, updated_at = NOW()
+           WHERE run_id = $3 AND slot_id = $4`,
+          [slotTarget, cumulativeTarget, runId, slot.id]
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      message: "Working hours updated successfully",
+      newTarget,
+      newTargetPerHour,
+      workingHours: wh
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error updating working hours:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
 // --------------------------------------------------------------
 // update the operator capacity ENDPOINTS
 // --------------------------------------------------------------
