@@ -1730,6 +1730,113 @@ app.put("/api/update-working-hours/:runId", authenticateToken, async (req, res) 
 });
 
 // --------------------------------------------------------------
+// update the line efficiency ENDPOINTS
+// --------------------------------------------------------------
+
+// ✅ Update efficiency for a run and recalculate target
+app.put("/api/update-efficiency/:runId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { runId } = req.params;
+    const { efficiency } = req.body;
+
+    if (!efficiency || efficiency <= 0 || efficiency > 1) {
+      return res.status(400).json({
+        success: false,
+        error: "Valid efficiency between 0 and 1 is required",
+      });
+    }
+
+    // Get current run data
+    const runResult = await client.query(
+      `SELECT operators_count, working_hours, sam_minutes, target_pcs, target_per_hour
+       FROM line_runs WHERE id = $1`,
+      [runId]
+    );
+
+    if (runResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Run not found",
+      });
+    }
+
+    const run = runResult.rows[0];
+    
+    // Recalculate target based on new efficiency
+    const operators = parseFloat(run.operators_count) || 0;
+    const sam = parseFloat(run.sam_minutes) || 0;
+    const wh = parseFloat(run.working_hours) || 0;
+    const eff = parseFloat(efficiency);
+
+    // Calculate new target
+    const totalMinutes = operators * wh * 60;
+    const piecesAt100 = sam > 0 ? totalMinutes / sam : 0;
+    const newTarget = piecesAt100 * eff;
+    
+    // Calculate new target per hour
+    const newTargetPerHour = wh > 0 ? newTarget / wh : 0;
+
+    // Update the run with new efficiency and recalculated targets
+    await client.query(
+      `UPDATE line_runs 
+       SET efficiency = $1, 
+           target_pcs = $2,
+           target_per_hour = $3,
+           updated_at = NOW()
+       WHERE id = $4`,
+      [eff, newTarget, newTargetPerHour, runId]
+    );
+
+    // Also update slot targets (redistribute target across slots proportionally)
+    const slotsResult = await client.query(
+      `SELECT id, planned_hours FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
+      [runId]
+    );
+
+    if (slotsResult.rows.length > 0) {
+      const totalPlannedHours = slotsResult.rows.reduce((sum, slot) => sum + parseFloat(slot.planned_hours), 0);
+      
+      let cumulativeTarget = 0;
+      for (const slot of slotsResult.rows) {
+        const slotHours = parseFloat(slot.planned_hours);
+        const slotTarget = totalPlannedHours > 0 ? (slotHours / totalPlannedHours) * newTarget : 0;
+        cumulativeTarget += slotTarget;
+
+        await client.query(
+          `UPDATE slot_targets 
+           SET slot_target = $1, cumulative_target = $2, updated_at = NOW()
+           WHERE run_id = $3 AND slot_id = $4`,
+          [slotTarget, cumulativeTarget, runId, slot.id]
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      message: "Efficiency updated successfully",
+      newTarget,
+      newTargetPerHour,
+      efficiency: eff
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error updating efficiency:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// --------------------------------------------------------------
 // update the operator capacity ENDPOINTS
 // --------------------------------------------------------------
 
