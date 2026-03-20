@@ -1730,6 +1730,83 @@ app.put("/api/update-working-hours/:runId", authenticateToken, async (req, res) 
 });
 
 // --------------------------------------------------------------
+// update the operator number ENDPOINTS
+// --------------------------------------------------------------
+
+// ✅ Update operator number for an existing run
+app.put("/api/run/:runId/operators/:operatorId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { runId, operatorId } = req.params;
+    const { operatorNo, operatorName } = req.body;
+
+    if (!operatorNo) {
+      return res.status(400).json({
+        success: false,
+        error: "Operator number is required",
+      });
+    }
+
+    // Check if the new operator number already exists in this run
+    const existingCheck = await client.query(
+      `SELECT id FROM run_operators 
+       WHERE run_id = $1 AND operator_no = $2 AND id != $3`,
+      [runId, parseInt(operatorNo), operatorId]
+    );
+
+    if (existingCheck.rows.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Operator number ${operatorNo} already exists in this run`,
+      });
+    }
+
+    // Get current operator info for logging
+    const currentOp = await client.query(
+      `SELECT operator_no FROM run_operators WHERE id = $1`,
+      [operatorId]
+    );
+
+    // Update the operator
+    const result = await client.query(
+      `UPDATE run_operators 
+       SET operator_no = $1, operator_name = COALESCE($2, operator_name)
+       WHERE id = $3 AND run_id = $4
+       RETURNING id, operator_no, operator_name`,
+      [parseInt(operatorNo), operatorName || null, operatorId, runId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Operator not found in this run",
+      });
+    }
+
+    await client.query("COMMIT");
+
+    console.log(`✅ Operator ${currentOp.rows[0]?.operator_no} → ${operatorNo} updated in run ${runId}`);
+
+    res.json({
+      success: true,
+      message: `Operator number updated successfully`,
+      operator: result.rows[0],
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error updating operator number:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+// --------------------------------------------------------------
 // update the line efficiency ENDPOINTS
 // --------------------------------------------------------------
 
