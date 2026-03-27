@@ -1007,6 +1007,298 @@ app.get("/api/lineleader/latest-run", authenticateToken, allowRoles("line_leader
     client.release();
   }
 });
+/**
+ * lines with multiple runs endpoint
+ */
+
+/**
+ * POST /api/multi-style/create-group
+ * Create a style group with multiple styles for the same line and date
+ */
+app.post("/api/multi-style/create-group", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { line, date, styles } = req.body;
+
+    if (!line || !date || !styles || !Array.isArray(styles) || styles.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields: line, date, and at least one style",
+      });
+    }
+
+    // Create the first style as the "parent" run
+    const firstStyle = styles[0];
+    const parentResult = await client.query(
+      `INSERT INTO line_runs (
+        line_no, run_date, style, operators_count, working_hours,
+        sam_minutes, efficiency, target_pcs, target_per_hour,
+        created_at, updated_at, style_group_name
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW(), $10)
+      RETURNING id`,
+      [
+        line,
+        date,
+        firstStyle.styleCode,
+        firstStyle.operatorsCount,
+        firstStyle.workingHours,
+        firstStyle.sam,
+        firstStyle.efficiency || 0.7,
+        firstStyle.targetPcs,
+        firstStyle.targetPerHour,
+        `Group_${line}_${date}_${firstStyle.styleCode}`
+      ]
+    );
+
+    const groupId = parentResult.rows[0].id;
+    const savedStyles = [{ id: groupId, style_code: firstStyle.styleCode }];
+
+    // Create additional styles as child runs linked to the parent
+    for (let i = 1; i < styles.length; i++) {
+      const style = styles[i];
+      const childResult = await client.query(
+        `INSERT INTO line_runs (
+          line_no, run_date, style, operators_count, working_hours,
+          sam_minutes, efficiency, target_pcs, target_per_hour,
+          style_group_id, style_group_name, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+        RETURNING id`,
+        [
+          line,
+          date,
+          style.styleCode,
+          style.operatorsCount,
+          style.workingHours,
+          style.sam,
+          style.efficiency || 0.7,
+          style.targetPcs,
+          style.targetPerHour,
+          groupId,
+          `Group_${line}_${date}_${firstStyle.styleCode}`
+        ]
+      );
+
+      savedStyles.push({ id: childResult.rows[0].id, style_code: style.styleCode });
+    }
+
+    // Save slots for each style
+    for (let i = 0; i < styles.length; i++) {
+      const style = styles[i];
+      const runId = savedStyles[i].id;
+
+      if (style.slots && style.slots.length > 0) {
+        for (let j = 0; j < style.slots.length; j++) {
+          const slot = style.slots[j];
+          await client.query(
+            `INSERT INTO shift_slots (
+              run_id, slot_order, slot_label, slot_start, slot_end, planned_hours
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              runId,
+              j + 1,
+              slot.label,
+              slot.startTime || null,
+              slot.endTime || null,
+              parseFloat(slot.hours) || 0,
+            ]
+          );
+        }
+      }
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      message: "Style group created successfully",
+      groupId,
+      styles: savedStyles,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error creating style group:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/multi-style/group-runs?line=8&date=2024-03-27
+ * Get all styles for a line on a specific date
+ */
+app.get("/api/multi-style/group-runs", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { line, date } = req.query;
+    if (!line || !date) {
+      return res.status(400).json({
+        success: false,
+        error: "line and date parameters are required",
+      });
+    }
+
+    // Find runs on this line and date
+    const runs = await client.query(
+      `SELECT * FROM line_runs
+       WHERE line_no = $1 AND run_date = $2
+       ORDER BY style_group_id NULLS FIRST, id`,
+      [line, date]
+    );
+
+    if (runs.rows.length === 0) {
+      return res.json({
+        success: false,
+        error: `No runs found for line ${line} on ${date}`,
+      });
+    }
+
+    // Group by style_group_id
+    const grouped = {};
+    for (const run of runs.rows) {
+      const groupKey = run.style_group_id || run.id;
+      if (!grouped[groupKey]) {
+        grouped[groupKey] = {
+          groupId: groupKey,
+          groupName: run.style_group_name || run.style,
+          line_no: run.line_no,
+          run_date: run.run_date,
+          styles: [],
+        };
+      }
+      
+      // Get slots for this run
+      const slots = await client.query(
+        `SELECT * FROM shift_slots
+         WHERE run_id = $1
+         ORDER BY slot_order`,
+        [run.id]
+      );
+      
+      grouped[groupKey].styles.push({
+        ...run,
+        slots: slots.rows,
+      });
+    }
+
+    res.json({
+      success: true,
+      groups: Object.values(grouped),
+    });
+  } catch (err) {
+    console.error("❌ Error fetching style groups:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/multi-style/latest-group?line=8
+ * Get the latest style group for a line
+ */
+app.get("/api/multi-style/latest-group", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const line = String(req.query.line || "").trim();
+    if (!line) {
+      return res.status(400).json({ success: false, error: "line is required" });
+    }
+
+    // Get the latest run date for this line
+    const latestDate = await client.query(
+      `SELECT DISTINCT run_date FROM line_runs
+       WHERE line_no = $1
+       ORDER BY run_date DESC
+       LIMIT 1`,
+      [line]
+    );
+
+    if (latestDate.rows.length === 0) {
+      return res.json({
+        success: false,
+        error: `No runs found for line ${line}`,
+      });
+    }
+
+    const date = latestDate.rows[0].run_date;
+
+    // Now get all runs for that date
+    const runs = await client.query(
+      `SELECT * FROM line_runs
+       WHERE line_no = $1 AND run_date = $2
+       ORDER BY style_group_id NULLS FIRST, id`,
+      [line, date]
+    );
+
+    // Group by style_group_id
+    const styles = [];
+    for (const run of runs.rows) {
+      // Get slots
+      const slots = await client.query(
+        `SELECT * FROM shift_slots
+         WHERE run_id = $1
+         ORDER BY slot_order`,
+        [run.id]
+      );
+      
+      // Get operators
+      const operators = await client.query(
+        `SELECT * FROM run_operators
+         WHERE run_id = $1
+         ORDER BY operator_no`,
+        [run.id]
+      );
+      
+      // Get slot targets
+      const slotTargets = await client.query(
+        `SELECT s.slot_label, t.slot_target, t.cumulative_target
+         FROM slot_targets t
+         JOIN shift_slots s ON t.slot_id = s.id
+         WHERE t.run_id = $1
+         ORDER BY s.slot_order`,
+        [run.id]
+      );
+      
+      styles.push({
+        run,
+        slots: slots.rows,
+        operators: operators.rows,
+        slotTargets: slotTargets.rows,
+      });
+    }
+
+    res.json({
+      success: true,
+      date,
+      styles,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching latest style group:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
 
 // Compatibility routes (server.js style)
 app.get("/api/run/:runId", authenticateToken, async (req, res, next) => {
