@@ -1301,35 +1301,44 @@ app.get("/api/multi-style/latest-group", authenticateToken, async (req, res) => 
 });
 
 // Compatibility routes (server.js style)
-app.get("/api/run/:runId", authenticateToken, async (req, res, next) => {
+app.get("/api/run/:runId", async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
 
     const { runId } = req.params;
 
+    // Get line run data
     const runResult = await client.query("SELECT * FROM line_runs WHERE id = $1", [runId]);
+
     if (runResult.rows.length === 0) {
-      return res.status(404).json({ success: false, error: "Run not found" });
+      return res.status(404).json({
+        success: false,
+        error: "Run not found",
+      });
     }
+
     const runData = runResult.rows[0];
 
+    // Get shift slots
     const slotsResult = await client.query(
-      `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours
-       FROM shift_slots
-       WHERE run_id = $1
+      `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours 
+       FROM shift_slots 
+       WHERE run_id = $1 
        ORDER BY slot_order`,
       [runId]
     );
 
+    // Get operators
     const operatorsResult = await client.query(
-      `SELECT id, operator_no, operator_name
-       FROM run_operators
-       WHERE run_id = $1
+      `SELECT id, operator_no, operator_name 
+       FROM run_operators 
+       WHERE run_id = $1 
        ORDER BY operator_no`,
       [runId]
     );
 
+    // Get slot targets
     const slotTargetsResult = await client.query(
       `SELECT s.slot_label, t.slot_target, t.cumulative_target
        FROM slot_targets t
@@ -1339,11 +1348,12 @@ app.get("/api/run/:runId", authenticateToken, async (req, res, next) => {
       [runId]
     );
 
+    // Get operations with their hourly data (both stitched and sewed)
     const operationsData = [];
 
     for (const operator of operatorsResult.rows) {
       const operationsResult = await client.query(
-        `SELECT
+        `SELECT 
           o.id,
           o.operation_name,
           o.t1_sec,
@@ -1352,13 +1362,25 @@ app.get("/api/run/:runId", authenticateToken, async (req, res, next) => {
           o.t4_sec,
           o.t5_sec,
           o.capacity_per_hour,
-          json_object_agg(
-            COALESCE(s.slot_label, ''),
-            COALESCE(h.stitched_qty, 0)
-          ) as stitched_data
+          COALESCE(
+            jsonb_object_agg(
+              COALESCE(s.slot_label, ''),
+              COALESCE(h.stitched_qty, 0)
+            ) FILTER (WHERE s.slot_label IS NOT NULL),
+            '{}'::jsonb
+          ) as stitched_data,
+          COALESCE(
+            jsonb_object_agg(
+              COALESCE(s2.slot_label, ''),
+              COALESCE(se.sewed_qty, 0)
+            ) FILTER (WHERE s2.slot_label IS NOT NULL),
+            '{}'::jsonb
+          ) as sewed_data
          FROM operator_operations o
          LEFT JOIN operation_hourly_entries h ON o.id = h.operation_id
          LEFT JOIN shift_slots s ON h.slot_id = s.id
+         LEFT JOIN operation_sewed_entries se ON o.id = se.operation_id
+         LEFT JOIN shift_slots s2 ON se.slot_id = s2.id
          WHERE o.run_operator_id = $1 AND o.run_id = $2
          GROUP BY o.id
          ORDER BY o.created_at`,
@@ -1380,7 +1402,11 @@ app.get("/api/run/:runId", authenticateToken, async (req, res, next) => {
       slotTargets: slotTargetsResult.rows,
     });
   } catch (err) {
-    next(err);
+    console.error("❌ Error fetching run data:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   } finally {
     client.release();
   }
