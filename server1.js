@@ -155,7 +155,7 @@ const runMigrations = async () => {
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CONSTRAINT chk_role CHECK (role IN ('engineer', 'line_leader', 'supervisor','soporte_it', 'skyrina')),
+        CONSTRAINT chk_role CHECK (role IN ('engineer', 'line_leader', 'supervisor','soporte_it', 'skyrina','master')),
         CONSTRAINT chk_line_number CHECK (line_number IS NULL OR (line_number >= 1 AND line_number <= 26))
       );
     `);
@@ -336,6 +336,7 @@ const seedDefaultUsers = async (client) => {
     { username: "supervisor", password: "supervisor123", role: "supervisor", full_name: "Production Supervisor" },
     { username: "soporte_it", password: "soporte_it123", role: "soporte_it", full_name: "IT Support" },
     { username: "skyrina", password: "skyrina123", role: "skyrina", full_name: "Skyrina" },
+    { username: "Salvador", password: "Cassab", role: "master", full_name: "Salvador Cassab" },
   ];
   for (let i = 1; i <= 26; i++) {
     defaultUsers.push({
@@ -2536,10 +2537,10 @@ app.get("/api/run-capacity-history/:runId", authenticateToken, async (req, res) 
 // --------------------------------------------------------------
 
 const requireSupervisor = (req, res, next) => {
-  if (req.user.role !== "supervisor" && req.user.role !== "soporte_it" && req.user.role !== "skyrina") {
+  if (req.user.role !== "supervisor" && req.user.role !== "soporte_it" && req.user.role !== "skyrina" && req.user.role !== "master") {
     return res.status(403).json({
       success: false,
-      error: "Access denied. Supervisor, IT Support, or Skyrina role required.",
+      error: "Access denied. Supervisor, IT Support, Skyrina, or Master role required.",
     });
   }
   next();
@@ -2943,6 +2944,828 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
   }
 });
 
+// ========== overview api endpoints ==========
+
+
+/**
+ * GET /api/skyrina/style-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns style performance with SAM-based efficiency (most accurate)
+ */
+app.get("/api/skyrina/style-performance", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { startDate, endDate, style, lineNo } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "startDate and endDate parameters required" 
+      });
+    }
+    
+    if (!['skyrina', 'engineer', 'supervisor', 'soporte_it', 'master'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+    
+    let query = `
+      WITH style_packing_data AS (
+        SELECT 
+          lr.style,
+          lr.sam_minutes,
+          lr.operators_count,
+          lr.working_hours,
+          lr.target_pcs,
+          lr.line_no,
+          COALESCE(SUM(se.sewed_qty), 0) as total_sewed
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date BETWEEN $1 AND $2
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+    `;
+    
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    
+    if (style && style !== 'all') {
+      query += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    
+    if (lineNo && lineNo !== 'all') {
+      query += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+    
+    query += `
+        GROUP BY lr.id, lr.style, lr.sam_minutes, lr.operators_count, lr.working_hours, lr.target_pcs, lr.line_no
+      )
+      SELECT 
+        style,
+        SUM(total_sewed) as total_produced,
+        SUM(target_pcs) as total_target,
+        SUM(total_sewed * sam_minutes) as total_sam_output,
+        SUM(operators_count * working_hours * 60) as total_available_minutes,
+        -- SAM-based efficiency (most accurate)
+        CASE 
+          WHEN SUM(operators_count * working_hours * 60) > 0 
+          THEN (SUM(total_sewed * sam_minutes) / SUM(operators_count * working_hours * 60)) * 100
+          ELSE 0
+        END as efficiency,
+        -- Production compliance (for reference only)
+        CASE 
+          WHEN SUM(target_pcs) > 0 
+          THEN (SUM(total_sewed) / SUM(target_pcs)) * 100 
+          ELSE 0 
+        END as compliance
+      FROM style_packing_data
+      GROUP BY style
+      ORDER BY efficiency DESC
+    `;
+    
+    const result = await client.query(query, params);
+    
+    const styles = result.rows.map(row => ({
+      style: row.style || 'No Style',
+      target: parseFloat(row.total_target) || 0,
+      produced: parseFloat(row.total_produced) || 0,
+      efficiency: parseFloat(row.efficiency) || 0,  // SAM-based efficiency
+      compliance: parseFloat(row.compliance) || 0,  // Production compliance
+      total_sam_output: parseFloat(row.total_sam_output) || 0,
+      total_available_minutes: parseFloat(row.total_available_minutes) || 0
+    }));
+    
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      styles
+    });
+  } catch (err) {
+    console.error("❌ Error fetching style performance:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/skyrina/line-performance-detail?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns line performance with SAM-based efficiency
+ */
+app.get("/api/skyrina/line-performance-detail", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { startDate, endDate, style, lineNo } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "startDate and endDate parameters required" 
+      });
+    }
+    
+    if (!['skyrina', 'engineer', 'supervisor', 'soporte_it', 'master'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+    
+    let query = `
+      WITH line_packing_data AS (
+        SELECT 
+          lr.style,
+          lr.line_no,
+          lr.sam_minutes,
+          lr.operators_count,
+          lr.working_hours,
+          lr.target_pcs,
+          COALESCE(SUM(se.sewed_qty), 0) as total_sewed
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date BETWEEN $1 AND $2
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+    `;
+    
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    
+    if (style && style !== 'all') {
+      query += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    
+    if (lineNo && lineNo !== 'all') {
+      query += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+    
+    query += `
+        GROUP BY lr.id, lr.style, lr.line_no, lr.sam_minutes, lr.operators_count, lr.working_hours, lr.target_pcs
+      ),
+      line_aggregates AS (
+        SELECT
+          style,
+          line_no,
+          SUM(total_sewed) as total_produced,
+          SUM(target_pcs) as total_target,
+          SUM(total_sewed * sam_minutes) as total_sam_output,
+          SUM(operators_count * working_hours * 60) as total_available_minutes
+        FROM line_packing_data
+        GROUP BY style, line_no
+      )
+      SELECT 
+        style,
+        line_no,
+        total_target as target,
+        total_produced as produced,
+        -- SAM-based efficiency
+        CASE 
+          WHEN total_available_minutes > 0 
+          THEN (total_sam_output / total_available_minutes) * 100
+          ELSE 0
+        END as efficiency,
+        -- Production compliance (for reference)
+        CASE 
+          WHEN total_target > 0 
+          THEN (total_produced / total_target) * 100 
+          ELSE 0 
+        END as compliance
+      FROM line_aggregates
+      ORDER BY line_no::int, efficiency DESC
+    `;
+    
+    const result = await client.query(query, params);
+    
+    const lines = result.rows.map(row => ({
+      style: row.style || 'No Style',
+      lineNo: row.line_no,
+      target: Math.round(parseFloat(row.target) * 100) / 100,
+      produced: Math.round(parseFloat(row.produced) * 100) / 100,
+      efficiency: parseFloat(row.efficiency) || 0,  // SAM-based efficiency
+      compliance: parseFloat(row.compliance) || 0   // Production compliance
+    }));
+    
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      lines
+    });
+  } catch (err) {
+    console.error("❌ Error fetching line performance detail:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/skyrina/available-styles?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+ * Returns list of unique styles in the date range
+ */
+app.get("/api/skyrina/available-styles", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "startDate and endDate parameters required" 
+      });
+    }
+    
+    const result = await client.query(
+      `SELECT DISTINCT style FROM line_runs 
+       WHERE run_date BETWEEN $1 AND $2 AND style IS NOT NULL AND style != ''
+       ORDER BY style`,
+      [startDate, endDate]
+    );
+    
+    const styles = result.rows.map(row => row.style);
+    
+    res.json({
+      success: true,
+      styles
+    });
+  } catch (err) {
+    console.error("❌ Error fetching available styles:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/skyrina/available-lines?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+ * Returns list of unique line numbers in the date range
+ */
+app.get("/api/skyrina/available-lines", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "startDate and endDate parameters required" 
+      });
+    }
+    
+    // Fix: Cast line_no to integer in SELECT as well, or remove ORDER BY cast
+    const result = await client.query(
+      `SELECT DISTINCT line_no, line_no::int as line_no_int 
+       FROM line_runs 
+       WHERE run_date BETWEEN $1 AND $2 AND line_no IS NOT NULL
+       ORDER BY line_no_int`,
+      [startDate, endDate]
+    );
+    
+    const lines = result.rows.map(row => row.line_no);
+    
+    res.json({
+      success: true,
+      lines
+    });
+  } catch (err) {
+    console.error("❌ Error fetching available lines:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/skyrina/period-summary?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns aggregated summary for a date range with filters
+ */
+/**
+ * GET /api/skyrina/period-summary?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns aggregated summary for a date range with CORRECT efficiency calculation
+ * Uses weighted average based on total SAM output vs total available minutes
+ */
+app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { startDate, endDate, style, lineNo } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "startDate and endDate parameters required" 
+      });
+    }
+    
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+    
+    let query = `
+      WITH packing_sewed AS (
+        SELECT 
+          lr.id as run_id,
+          lr.line_no,
+          lr.target_pcs,
+          lr.operators_count,
+          lr.working_hours,
+          lr.sam_minutes,
+          COALESCE(SUM(se.sewed_qty), 0) as total_sewed
+        FROM line_runs lr
+        LEFT JOIN run_operators ro ON lr.id = ro.run_id
+        LEFT JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date BETWEEN $1 AND $2
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%' OR oo.operation_name IS NULL)
+    `;
+    
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    
+    if (style && style !== 'all') {
+      query += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    
+    if (lineNo && lineNo !== 'all') {
+      query += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+    
+    query += `
+        GROUP BY lr.id, lr.line_no, lr.target_pcs, lr.operators_count, lr.working_hours, lr.sam_minutes
+      )
+      SELECT 
+        COUNT(DISTINCT run_id) as total_runs,
+        COUNT(DISTINCT line_no) as lines_used,
+        COALESCE(SUM(total_sewed), 0) as total_sewed,
+        COALESCE(SUM(target_pcs), 0) as total_target,
+        -- CORRECT EFFICIENCY: Total SAM output / Total available minutes (NO ROUNDING)
+        CASE 
+          WHEN SUM(operators_count * working_hours * 60) > 0 
+          THEN (SUM(total_sewed * sam_minutes) / SUM(operators_count * working_hours * 60)) * 100
+          ELSE 0
+        END as avg_efficiency
+      FROM packing_sewed
+    `;
+    
+    const result = await client.query(query, params);
+    
+    const summary = result.rows[0] || {
+      total_runs: 0,
+      lines_used: 0,
+      total_sewed: 0,
+      total_target: 0,
+      avg_efficiency: 0
+    };
+    
+    const avgEfficiency = parseFloat(summary.avg_efficiency) || 0;
+    
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      summary: {
+        totalRuns: parseInt(summary.total_runs) || 0,
+        linesUsed: parseInt(summary.lines_used) || 0,
+        totalTarget: parseFloat(summary.total_target) || 0,  // NO ROUNDING
+        totalSewed: parseFloat(summary.total_sewed) || 0,    // NO ROUNDING
+        avgEfficiency: avgEfficiency  // NO ROUNDING - keep exact value
+      }
+    });
+  } catch (err) {
+    console.error("❌ Error fetching period summary:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/skyrina/product-breakdown?date=YYYY-MM-DD
+ * Returns product (style) breakdown with sewed quantities for a specific date
+ */
+app.get("/api/skyrina/product-breakdown", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter required" });
+    }
+    
+    // Check if user has access
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+    
+    const query = `
+      SELECT 
+        lr.style,
+        COALESCE(SUM(se.sewed_qty), 0) as sewed,
+        lr.target_pcs as target,
+        lr.line_no
+      FROM line_runs lr
+      JOIN run_operators ro ON lr.id = ro.run_id
+      JOIN operator_operations oo ON ro.id = oo.run_operator_id
+      LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+      WHERE lr.run_date = $1
+        AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+      GROUP BY lr.id, lr.style, lr.target_pcs, lr.line_no
+      ORDER BY sewed DESC
+    `;
+    
+    const result = await client.query(query, [date]);
+    
+    // Group by style (in case same style runs on multiple lines)
+    const styleMap = new Map();
+    
+    for (const row of result.rows) {
+      const style = row.style || 'Sin Estilo';
+      const current = styleMap.get(style) || { 
+        style, 
+        sewed: 0, 
+        target: 0
+      };
+      
+      current.sewed += parseFloat(row.sewed) || 0;
+      current.target += parseFloat(row.target) || 0;
+      
+      styleMap.set(style, current);
+    }
+    
+    const products = Array.from(styleMap.values())
+      .sort((a, b) => b.sewed - a.sewed);
+    
+    res.json({
+      success: true,
+      date,
+      products,
+      totalProducts: products.length
+    });
+  } catch (err) {
+    console.error("❌ Error fetching product breakdown:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+// Add this new endpoint in server.js (before the period-summary endpoint)
+
+/**
+ * GET /api/skyrina/line-efficiency?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns per-line efficiency calculated with SAM formula (server-side) with filters
+ */
+app.get("/api/skyrina/line-efficiency", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { startDate, endDate, style, lineNo } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "startDate and endDate parameters required" 
+      });
+    }
+    
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+    
+    let query = `
+      WITH packing_sewed AS (
+        SELECT 
+          lr.id as run_id,
+          lr.line_no,
+          lr.operators_count,
+          lr.working_hours,
+          lr.sam_minutes,
+          lr.target_pcs,
+          COALESCE(SUM(se.sewed_qty), 0) as total_sewed
+        FROM line_runs lr
+        LEFT JOIN run_operators ro ON lr.id = ro.run_id
+        LEFT JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date BETWEEN $1 AND $2
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%' OR oo.operation_name IS NULL)
+    `;
+    
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    
+    if (style && style !== 'all') {
+      query += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    
+    if (lineNo && lineNo !== 'all') {
+      query += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+    
+    query += `
+        GROUP BY lr.id, lr.line_no, lr.operators_count, lr.working_hours, lr.sam_minutes, lr.target_pcs
+      ),
+      line_aggregates AS (
+        SELECT
+          line_no,
+          SUM(total_sewed) as total_sewed,
+          SUM(target_pcs) as total_target,
+          SUM(operators_count * working_hours * 60) as total_available_minutes,
+          SUM(total_sewed * sam_minutes) as total_sam_output
+        FROM packing_sewed
+        GROUP BY line_no
+      )
+      SELECT 
+        line_no,
+        total_sewed as quantity,
+        total_target as target,
+        CASE 
+          WHEN total_available_minutes > 0 
+          THEN (total_sam_output / total_available_minutes) * 100
+          ELSE 0
+        END as efficiency
+      FROM line_aggregates
+      ORDER BY line_no::int
+    `;
+    
+    const result = await client.query(query, params);
+    
+    const lines = result.rows.map(row => ({
+      lineNo: row.line_no,
+      quantity: parseFloat(row.quantity) || 0,
+      target: parseFloat(row.target) || 0,
+      efficiency: parseFloat(row.efficiency) || 0  // NO ROUNDING - keep exact value
+    }));
+    
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      lines
+    });
+  } catch (err) {
+    console.error("❌ Error fetching line efficiency:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+/**
+ * GET /api/skyrina/style-efficiency-sam?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Returns style efficiency calculated using SAM (standard allowed minutes)
+ * This is more accurate than production compliance
+ */
+app.get("/api/skyrina/style-efficiency-sam", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { startDate, endDate, style, lineNo } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "startDate and endDate parameters required" 
+      });
+    }
+    
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+    
+    let query = `
+      WITH style_packing_data AS (
+        SELECT 
+          lr.style,
+          lr.sam_minutes,
+          lr.operators_count,
+          lr.working_hours,
+          lr.target_pcs,
+          lr.line_no,
+          COALESCE(SUM(se.sewed_qty), 0) as total_sewed
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date BETWEEN $1 AND $2
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+    `;
+    
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    
+    if (style && style !== 'all') {
+      query += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    
+    if (lineNo && lineNo !== 'all') {
+      query += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+    
+    query += `
+        GROUP BY lr.id, lr.style, lr.sam_minutes, lr.operators_count, lr.working_hours, lr.target_pcs, lr.line_no
+      )
+      SELECT 
+        style,
+        SUM(total_sewed) as total_produced,
+        SUM(target_pcs) as total_target,
+        SUM(total_sewed * sam_minutes) as total_sam_output,
+        SUM(operators_count * working_hours * 60) as total_available_minutes,
+        CASE 
+          WHEN SUM(operators_count * working_hours * 60) > 0 
+          THEN (SUM(total_sewed * sam_minutes) / SUM(operators_count * working_hours * 60)) * 100
+          ELSE 0
+        END as efficiency,
+        CASE 
+          WHEN SUM(target_pcs) > 0 
+          THEN (SUM(total_sewed) / SUM(target_pcs)) * 100 
+          ELSE 0 
+        END as compliance
+      FROM style_packing_data
+      GROUP BY style
+      ORDER BY efficiency DESC
+    `;
+    
+    const result = await client.query(query, params);
+    
+    const styles = result.rows.map(row => ({
+      style: row.style || 'No Style',
+      target: parseFloat(row.total_target) || 0,
+      produced: parseFloat(row.total_produced) || 0,
+      efficiency: parseFloat(row.efficiency) || 0,  // SAM-based efficiency
+      compliance: parseFloat(row.compliance) || 0,  // Production compliance
+      total_sam_output: parseFloat(row.total_sam_output) || 0,
+      total_available_minutes: parseFloat(row.total_available_minutes) || 0
+    }));
+    
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      styles
+    });
+  } catch (err) {
+    console.error("❌ Error fetching style efficiency (SAM):", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+/**
+ * GET /api/skyrina/line-performance-detail?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+ * Returns line performance with style, target, produced, and compliance
+ */
+app.get("/api/skyrina/line-performance-detail", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "startDate and endDate parameters required" 
+      });
+    }
+    
+    // Check if user has access
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+    
+    const query = `
+      WITH line_data AS (
+        SELECT 
+          lr.style,
+          lr.line_no,
+          lr.target_pcs as target,
+          COALESCE(SUM(se.sewed_qty), 0) as produced,
+          lr.run_date
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date BETWEEN $1 AND $2
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%' OR oo.operation_name IS NULL)
+        GROUP BY lr.id, lr.style, lr.line_no, lr.target_pcs, lr.run_date
+      )
+      SELECT 
+        style,
+        line_no,
+        SUM(target) as total_target,
+        SUM(produced) as total_produced,
+        CASE 
+          WHEN SUM(target) > 0 
+          THEN (SUM(produced) / SUM(target)) * 100 
+          ELSE 0 
+        END as compliance
+      FROM line_data
+      GROUP BY style, line_no
+      ORDER BY line_no::int, total_produced DESC
+    `;
+    
+    const result = await client.query(query, [startDate, endDate]);
+    
+    const lines = result.rows.map(row => ({
+      style: row.style || 'Sin Estilo',
+      lineNo: row.line_no,
+      target: Math.round(parseFloat(row.total_target) * 100) / 100,
+      produced: Math.round(parseFloat(row.total_produced) * 100) / 100,
+      compliance: Math.min(Math.round(parseFloat(row.compliance) * 100) / 100, 100)
+    }));
+    
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      lines
+    });
+  } catch (err) {
+    console.error("❌ Error fetching line performance detail:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/skyrina/product-performance?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+ * Returns product performance with style, target, produced, and compliance
+ */
+app.get("/api/skyrina/product-performance", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "startDate and endDate parameters required" 
+      });
+    }
+    
+    // Check if user has access
+    if (!['skyrina', 'engineer', 'supervisor', 'soporte_it', 'master'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+    
+    const query = `
+      WITH product_data AS (
+        SELECT 
+          lr.style,
+          lr.target_pcs as target,
+          COALESCE(SUM(se.sewed_qty), 0) as produced,
+          lr.line_no,
+          lr.run_date
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date BETWEEN $1 AND $2
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%' OR oo.operation_name IS NULL)
+        GROUP BY lr.id, lr.style, lr.target_pcs, lr.line_no, lr.run_date
+      )
+      SELECT 
+        style,
+        SUM(target) as total_target,
+        SUM(produced) as total_produced,
+        CASE 
+          WHEN SUM(target) > 0 
+          THEN (SUM(produced) / SUM(target)) * 100 
+          ELSE 0 
+        END as compliance
+      FROM product_data
+      GROUP BY style
+      ORDER BY total_produced DESC
+    `;
+    
+    const result = await client.query(query, [startDate, endDate]);
+    
+    const products = result.rows.map(row => ({
+      style: row.style || 'Sin Estilo',
+      target: Math.round(parseFloat(row.total_target) * 100) / 100,
+      produced: Math.round(parseFloat(row.total_produced) * 100) / 100,
+      compliance: Math.min(Math.round(parseFloat(row.compliance) * 100) / 100, 100)
+    }));
+    
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      products
+    });
+  } catch (err) {
+    console.error("❌ Error fetching product performance:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ----------------------------------------------------------------------
 // 15. ENGINEER LINE BALANCING ENDPOINTS
 // ----------------------------------------------------------------------
@@ -3141,7 +3964,7 @@ app.get("/api/supervisor/assignments", authenticateToken, requireSupervisor, asy
 // ----------------------------------------------------------------------
 // 18. USER MANAGEMENT
 // ----------------------------------------------------------------------
-app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor", "soporte_it", "skyrina"), async (req, res, next) => {
+app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor", "soporte_it", "skyrina","master"), async (req, res, next) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
@@ -3149,7 +3972,7 @@ app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor", "s
       `SELECT id, username, role, line_number, full_name, is_active, created_at, updated_at
        FROM users
        ORDER BY
-         CASE role WHEN 'engineer' THEN 1 WHEN 'supervisor' THEN 2 WHEN 'line_leader' THEN 3 WHEN 'soporte_it' THEN 4 WHEN 'skyrina' THEN 5 ELSE 6 END,
+         CASE role WHEN 'engineer' THEN 1 WHEN 'supervisor' THEN 2 WHEN 'line_leader' THEN 3 WHEN 'soporte_it' THEN 4 WHEN 'skyrina' THEN 5 WHEN 'master' THEN 6 ELSE 7 END,
          line_number NULLS FIRST,
          username`
     );
@@ -3164,11 +3987,11 @@ app.get("/api/users", authenticateToken, allowRoles("engineer", "supervisor", "s
 app.post(
   "/api/users",
   authenticateToken,
-  allowRoles("engineer", "supervisor"),
+  allowRoles("engineer", "supervisor","master"),
   validate([
     body("username").notEmpty().withMessage("Username required"),
     body("password").isLength({ min: 8 }).withMessage("Password must be at least 8 characters"),
-    body("role").isIn(["engineer", "line_leader", "supervisor", "soporte_it", "skyrina"]).withMessage("Invalid role"),
+    body("role").isIn(["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "master"]).withMessage("Invalid role"),
     body("line_number").if(body("role").equals("line_leader")).isInt({ min: 1, max: 26 }).withMessage("Line number 1-26 required for line leader"),
   ]),
   async (req, res, next) => {
@@ -3212,7 +4035,7 @@ app.post(
   }
 );
 
-app.put("/api/users/:id", authenticateToken, allowRoles("engineer", "supervisor"), async (req, res, next) => {
+app.put("/api/users/:id", authenticateToken, allowRoles("engineer", "supervisor", "master"), async (req, res, next) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
@@ -3275,7 +4098,7 @@ app.put("/api/users/:id", authenticateToken, allowRoles("engineer", "supervisor"
   }
 });
 
-app.delete("/api/users/:id", authenticateToken, allowRoles("engineer", "supervisor"), async (req, res, next) => {
+app.delete("/api/users/:id", authenticateToken, allowRoles("engineer", "supervisor", "master"), async (req, res, next) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
