@@ -1581,6 +1581,67 @@ app.post(
   }
 );
 
+// ----------------------------------------------------------------------
+// 14. To Delete RUN ENDPOINT (from server.js)
+// ----------------------------------------------------------------------
+
+// ✅ Delete a line run and all associated data
+app.delete("/api/run/:runId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { runId } = req.params;
+
+    // Check if run exists
+    const runCheck = await client.query(
+      "SELECT id, line_no, run_date FROM line_runs WHERE id = $1",
+      [runId]
+    );
+
+    if (runCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        error: "Run not found",
+      });
+    }
+
+    const run = runCheck.rows[0];
+
+    // Check if user has permission to delete (engineer, supervisor, master, soporte_it)
+    const allowedRoles = ['engineer', 'supervisor', 'master', 'soporte_it'];
+    if (!allowedRoles.includes(req.user.role)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        error: "Access denied. Only engineers, supervisors, or support can delete runs.",
+      });
+    }
+
+    // Delete the run (CASCADE will handle all related data)
+    await client.query("DELETE FROM line_runs WHERE id = $1", [runId]);
+
+    await client.query("COMMIT");
+
+    console.log(`✅ Run ${runId} (Line ${run.line_no}, ${run.run_date}) deleted by user ${req.user.username}`);
+
+    res.json({
+      success: true,
+      message: `Run from line ${run.line_no} on ${run.run_date} deleted successfully`,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error deleting run:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
 
 
 // ----------------------------------------------------------------------
