@@ -2110,6 +2110,10 @@ app.put("/api/update-operator-count/:runId", authenticateToken, async (req, res)
 // update-working-hours (FIXED)
 // --------------------------------------------------------------
 
+// --------------------------------------------------------------
+// update-working-hours (FIXED)
+// --------------------------------------------------------------
+
 // ✅ Update working hours for a run and recalculate target
 app.put("/api/update-working-hours/:runId", authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -2204,6 +2208,124 @@ app.put("/api/update-working-hours/:runId", authenticateToken, async (req, res) 
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error updating working hours:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// --------------------------------------------------------------
+//  Update shift slot planned hours for a run
+// --------------------------------------------------------------
+app.put("/api/update-shift-slots/:runId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { runId } = req.params;
+    const { slots } = req.body; // Array of { slotId, plannedHours, slotLabel }
+
+    if (!slots || !Array.isArray(slots)) {
+      return res.status(400).json({
+        success: false,
+        error: "Slots array is required",
+      });
+    }
+
+    // Get current run data for target recalculation
+    const runResult = await client.query(
+      `SELECT operators_count, working_hours, sam_minutes, efficiency, target_pcs
+       FROM line_runs WHERE id = $1`,
+      [runId]
+    );
+
+    if (runResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Run not found",
+      });
+    }
+
+    const run = runResult.rows[0];
+    
+    // Update each slot's planned hours
+    for (const slot of slots) {
+      await client.query(
+        `UPDATE shift_slots 
+         SET planned_hours = $1
+         WHERE id = $2 AND run_id = $3`,
+        [parseFloat(slot.plannedHours), slot.slotId, runId]
+      );
+    }
+
+    // Recalculate total working hours from slots
+    const slotsResult = await client.query(
+      `SELECT planned_hours FROM shift_slots WHERE run_id = $1 ORDER BY slot_order`,
+      [runId]
+    );
+
+    const totalPlannedHours = slotsResult.rows.reduce(
+      (sum, slot) => sum + parseFloat(slot.planned_hours), 
+      0
+    );
+
+    // Recalculate target based on new total working hours
+    const operators = parseFloat(run.operators_count) || 0;
+    const sam = parseFloat(run.sam_minutes) || 0;
+    const efficiency = parseFloat(run.efficiency) || 0.7;
+    const wh = totalPlannedHours;
+
+    const totalMinutes = operators * wh * 60;
+    const piecesAt100 = sam > 0 ? totalMinutes / sam : 0;
+    const newTarget = piecesAt100 * efficiency;
+    const newTargetPerHour = wh > 0 ? newTarget / wh : 0;
+
+    // Update line_runs with new working hours and targets
+    await client.query(
+      `UPDATE line_runs 
+       SET working_hours = $1,
+           target_pcs = $2,
+           target_per_hour = $3,
+           updated_at = NOW()
+       WHERE id = $4`,
+      [wh, newTarget, newTargetPerHour, runId]
+    );
+
+    // Update slot targets (redistribute target across slots proportionally)
+    let cumulativeTarget = 0;
+    for (const slot of slotsResult.rows) {
+      const slotHours = parseFloat(slot.planned_hours);
+      const slotTarget = totalPlannedHours > 0 ? (slotHours / totalPlannedHours) * newTarget : 0;
+      cumulativeTarget += slotTarget;
+
+      await client.query(
+        `UPDATE slot_targets 
+         SET slot_target = $1, cumulative_target = $2, updated_at = NOW()
+         WHERE run_id = $3 AND slot_id = $4`,
+        [slotTarget, cumulativeTarget, runId, slot.id]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      message: "Shift slots updated successfully",
+      workingHours: wh,
+      newTarget,
+      newTargetPerHour,
+      slots: slotsResult.rows.map(slot => ({
+        ...slot,
+        planned_hours: parseFloat(slot.planned_hours)
+      }))
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error updating shift slots:", err.message);
     res.status(500).json({
       success: false,
       error: err.message,
