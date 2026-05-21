@@ -3948,7 +3948,149 @@ app.get("/api/skyrina/product-performance", authenticateToken, async (req, res) 
     client.release();
   }
 });
+// ========== BATCH ENDPOINT FOR SKYRINA DASHBOARD ==========
+app.post(
+  "/api/batch/line-runs-data",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      
+      const { lines, date } = req.body;
+      
+      // Validate inputs manually
+      if (!lines || !Array.isArray(lines)) {
+        return res.status(400).json({ success: false, error: "lines array required" });
+      }
+      if (!date) {
+        return res.status(400).json({ success: false, error: "date required" });
+      }
+      
+      const results = {};
+      
+      for (const lineNo of lines) {
+        // Get runs for this line
+        const runsResult = await client.query(
+          `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes,
+                  efficiency, target_pcs, target_per_hour, created_at
+           FROM line_runs
+           WHERE line_no = $1 AND run_date = $2
+           ORDER BY run_date DESC`,
+          [lineNo, date]
+        );
+        
+        const lineRuns = [];
+        
+        for (const run of runsResult.rows) {
+          // Get full run data using the helper function
+          const runData = await getFullRunDataBatch(client, run.id);
+          lineRuns.push({
+            ...run,
+            runData
+          });
+        }
+        
+        results[lineNo] = lineRuns;
+      }
+      
+      res.json({ success: true, data: results });
+    } catch (err) {
+      console.error("❌ Error in batch endpoint:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  }
+);
 
+// ========== HELPER FUNCTION FOR BATCH ENDPOINT ==========
+// Single, clean version - no duplicates!
+async function getFullRunDataBatch(client, runId) {
+  // Get slots
+  const slotsResult = await client.query(
+    `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours 
+     FROM shift_slots 
+     WHERE run_id = $1 
+     ORDER BY slot_order`,
+    [runId]
+  );
+  
+  // Get operators
+  const operatorsResult = await client.query(
+    `SELECT id, operator_no, operator_name 
+     FROM run_operators 
+     WHERE run_id = $1 
+     ORDER BY operator_no`,
+    [runId]
+  );
+  
+  // Get slot targets
+  const slotTargetsResult = await client.query(
+    `SELECT s.slot_label, t.slot_target, t.cumulative_target
+     FROM slot_targets t
+     JOIN shift_slots s ON t.slot_id = s.id
+     WHERE t.run_id = $1
+     ORDER BY s.slot_order`,
+    [runId]
+  );
+  
+  // Get operations with their data
+  const operationsData = [];
+  
+  for (const operator of operatorsResult.rows) {
+    const operationsResult = await client.query(
+      `SELECT 
+        o.id,
+        o.operation_name,
+        o.t1_sec,
+        o.t2_sec,
+        o.t3_sec,
+        o.t4_sec,
+        o.t5_sec,
+        o.capacity_per_hour,
+        COALESCE(
+          jsonb_object_agg(
+            COALESCE(s.slot_label, ''),
+            COALESCE(h.stitched_qty, 0)
+          ) FILTER (WHERE s.slot_label IS NOT NULL),
+          '{}'::jsonb
+        ) as stitched_data,
+        COALESCE(
+          jsonb_object_agg(
+            COALESCE(s2.slot_label, ''),
+            COALESCE(se.sewed_qty, 0)
+          ) FILTER (WHERE s2.slot_label IS NOT NULL),
+          '{}'::jsonb
+        ) as sewed_data
+       FROM operator_operations o
+       LEFT JOIN operation_hourly_entries h ON o.id = h.operation_id
+       LEFT JOIN shift_slots s ON h.slot_id = s.id
+       LEFT JOIN operation_sewed_entries se ON o.id = se.operation_id
+       LEFT JOIN shift_slots s2 ON se.slot_id = s2.id
+       WHERE o.run_operator_id = $1 AND o.run_id = $2
+       GROUP BY o.id
+       ORDER BY o.created_at`,
+      [operator.id, runId]
+    );
+    
+    operationsData.push({
+      operator: {
+        id: operator.id,
+        operator_no: operator.operator_no,
+        operator_name: operator.operator_name
+      },
+      operations: operationsResult.rows,
+    });
+  }
+  
+  return {
+    slots: slotsResult.rows,
+    operators: operatorsResult.rows,
+    operations: operationsData,
+    slotTargets: slotTargetsResult.rows,
+  };
+}
 // ----------------------------------------------------------------------
 // 15. ENGINEER LINE BALANCING ENDPOINTS
 // ----------------------------------------------------------------------
