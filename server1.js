@@ -295,6 +295,77 @@ await client.query(`
 `);
 console.log("✅ operator_capacity_history table ready in prod_db_schema");
 
+// 8. Create quality_inspections table
+await client.query(`
+  CREATE TABLE IF NOT EXISTS quality_inspections(
+    id BIGSERIAL PRIMARY KEY,
+    line_no TEXT NOT NULL,
+    inspector_name VARCHAR(100) NOT NULL,
+    inspection_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    shift_slot VARCHAR(50),
+    total_defects INT DEFAULT 0,
+    total_checked_quantity NUMERIC(12,2) DEFAULT 0,
+    bad_type TEXT,
+    bad_reason TEXT,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+`);
+// Add bad_type / bad_reason columns to existing databases (no-op if already present)
+await client.query("ALTER TABLE quality_inspections ADD COLUMN IF NOT EXISTS bad_type TEXT;");
+await client.query("ALTER TABLE quality_inspections ADD COLUMN IF NOT EXISTS bad_reason TEXT;");
+console.log("✅ quality_inspections table ready");
+
+// 9. Create quality_defect_types table (master data)
+await client.query(`
+  CREATE TABLE IF NOT EXISTS quality_defect_types(
+    id BIGSERIAL PRIMARY KEY,
+    defect_code VARCHAR(20) UNIQUE NOT NULL,
+    defect_name VARCHAR(100) NOT NULL,
+    category VARCHAR(50) NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    sort_order INT DEFAULT 0
+  );
+`);
+console.log("✅ quality_defect_types table ready");
+
+// 10. Create quality_defect_reasons table (master data)
+await client.query(`
+  CREATE TABLE IF NOT EXISTS quality_defect_reasons(
+    id BIGSERIAL PRIMARY KEY,
+    defect_type_id BIGINT NOT NULL REFERENCES quality_defect_types(id) ON DELETE CASCADE,
+    reason_code VARCHAR(20) NOT NULL,
+    reason_description TEXT NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    sort_order INT DEFAULT 0,
+    UNIQUE(defect_type_id, reason_code)
+  );
+`);
+console.log("✅ quality_defect_reasons table ready");
+
+// 11. Create quality_defect_entries table (actual defects recorded)
+await client.query(`
+  CREATE TABLE IF NOT EXISTS quality_defect_entries(
+    id BIGSERIAL PRIMARY KEY,
+    inspection_id BIGINT NOT NULL REFERENCES quality_inspections(id) ON DELETE CASCADE,
+    defect_type_id BIGINT NOT NULL REFERENCES quality_defect_types(id),
+    defect_reason_id BIGINT REFERENCES quality_defect_reasons(id),
+    defect_quantity INT NOT NULL DEFAULT 1,
+    operation_name VARCHAR(100),
+    operator_no INT,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+`);
+console.log("✅ quality_defect_entries table ready");
+
+// 12. Create indexes for quality tables
+await client.query("CREATE INDEX IF NOT EXISTS idx_quality_inspections_line_date ON quality_inspections(line_no, inspection_date);");
+await client.query("CREATE INDEX IF NOT EXISTS idx_quality_inspections_inspector ON quality_inspections(inspector_name);");
+await client.query("CREATE INDEX IF NOT EXISTS idx_quality_defect_entries_inspection ON quality_defect_entries(inspection_id);");
+await client.query("CREATE INDEX IF NOT EXISTS idx_quality_defect_entries_type ON quality_defect_entries(defect_type_id);");
+
 
 
     // Create index for faster queries
@@ -2709,6 +2780,398 @@ app.get("/api/run-capacity-history/:runId", authenticateToken, async (req, res) 
       success: false,
       error: err.message,
     });
+  } finally {
+    client.release();
+  }
+});
+
+// ========== QUALITY INSPECTOR ROUTES ==========
+// Make sure this is AFTER authenticateToken is defined
+
+// Helper middleware for quality inspector access
+const requireQualityInspector = (req, res, next) => {
+  const allowedRoles = ['quality_inspector', 'engineer', 'supervisor', 'soporte_it', 'master'];
+  if (!allowedRoles.includes(req.user?.role)) {
+    return res.status(403).json({
+      success: false,
+      error: "Access denied. Quality inspector role required.",
+    });
+  }
+  next();
+};
+
+/**
+ * GET /api/quality/lines
+ * Returns all lines that have active runs (for line selection)
+ */
+app.get("/api/quality/lines", authenticateToken, requireQualityInspector, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const result = await client.query(`
+      WITH distinct_lines AS (
+        SELECT DISTINCT ON (line_no) 
+          line_no,
+          style as current_style,
+          created_at
+        FROM line_runs
+        WHERE line_no IS NOT NULL AND line_no != ''
+        ORDER BY line_no, created_at DESC
+      )
+      SELECT line_no, current_style
+      FROM distinct_lines
+      ORDER BY line_no::int
+    `);
+    
+    res.json({
+      success: true,
+      lines: result.rows.map(row => ({
+        line_no: row.line_no,
+        current_style: row.current_style,
+        has_today_run: false
+      })),
+    });
+  } catch (err) {
+    console.error("❌ Error fetching quality lines:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/quality/lines/:lineNo/runs
+ * Returns runs for a specific line (distinct by date and style)
+ */
+app.get("/api/quality/lines/:lineNo/runs", authenticateToken, requireQualityInspector, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { lineNo } = req.params;
+    
+    // Get distinct runs (remove duplicates if any)
+    const result = await client.query(`
+      SELECT DISTINCT ON (run_date, style)
+        id, 
+        line_no, 
+        run_date, 
+        style, 
+        target_pcs, 
+        operators_count, 
+        working_hours
+      FROM line_runs
+      WHERE line_no = $1
+      ORDER BY run_date DESC, style, id DESC
+    `, [lineNo]);
+    
+    console.log(`✅ Found ${result.rows.length} distinct runs for line ${lineNo}`);
+    
+    res.json({
+      success: true,
+      runs: result.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching line runs:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/quality/inspections/:lineNo
+ * Returns inspections for a specific line
+ */
+app.get("/api/quality/inspections/:lineNo", authenticateToken, requireQualityInspector, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { lineNo } = req.params;
+    
+    const result = await client.query(`
+      SELECT i.*, 
+             COUNT(de.id) as total_defect_entries,
+             COALESCE(SUM(de.defect_quantity), 0) as total_defects
+      FROM quality_inspections i
+      LEFT JOIN quality_defect_entries de ON i.id = de.inspection_id
+      WHERE i.line_no = $1
+      GROUP BY i.id
+      ORDER BY i.inspection_date DESC, i.created_at DESC
+    `, [lineNo]);
+    
+    res.json({
+      success: true,
+      inspections: result.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching inspections:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/quality/inspection/:inspectionId
+ * Returns full inspection details
+ */
+app.get("/api/quality/inspection/:inspectionId", authenticateToken, requireQualityInspector, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { inspectionId } = req.params;
+    
+    const inspectionResult = await client.query(`
+      SELECT * FROM quality_inspections WHERE id = $1
+    `, [inspectionId]);
+    
+    if (inspectionResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Inspection not found" });
+    }
+    
+    const defectsResult = await client.query(`
+      SELECT 
+        de.*,
+        dt.defect_code,
+        dt.defect_name,
+        dt.category,
+        dr.reason_code,
+        dr.reason_description
+      FROM quality_defect_entries de
+      JOIN quality_defect_types dt ON de.defect_type_id = dt.id
+      LEFT JOIN quality_defect_reasons dr ON de.defect_reason_id = dr.id
+      WHERE de.inspection_id = $1
+      ORDER BY de.created_at DESC
+    `, [inspectionId]);
+    
+    res.json({
+      success: true,
+      inspection: inspectionResult.rows[0],
+      defects: defectsResult.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching inspection details:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+app.get("/api/quality/defect-types", authenticateToken, requireQualityInspector, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const result = await client.query(`
+      SELECT 
+        dt.id,
+        dt.defect_code,
+        dt.defect_name,
+        dt.category,
+        dt.sort_order,
+        COALESCE(
+          (SELECT json_agg(
+            json_build_object(
+              'id', dr.id,
+              'reason_code', dr.reason_code,
+              'reason_description', dr.reason_description
+            ) ORDER BY dr.sort_order
+          )
+          FROM quality_defect_reasons dr
+          WHERE dr.defect_type_id = dt.id AND dr.is_active = true),
+          '[]'::json
+        ) as reasons
+      FROM quality_defect_types dt
+      WHERE dt.is_active = true
+      ORDER BY dt.sort_order
+    `);
+    
+    // Add this debug log
+    console.log('Defect types with reasons:');
+    result.rows.forEach(row => {
+      console.log(`  ${row.sort_order}. ${row.defect_name}: ${row.reasons?.length || 0} reasons`);
+    });
+    
+    res.json({
+      success: true,
+      defectTypes: result.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching defect types:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+/**
+ * POST /api/quality/inspection
+ * Create a new inspection
+ */
+app.post("/api/quality/inspection", authenticateToken, requireQualityInspector, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+    
+    const { 
+      lineNo, 
+      inspectorName, 
+      inspectionDate,
+      shiftSlot,
+      totalCheckedQuantity,
+      notes,
+      defects 
+    } = req.body;
+    
+    if (!lineNo || !inspectorName || !defects || !Array.isArray(defects)) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields: lineNo, inspectorName, and defects array"
+      });
+    }
+    
+    const totalDefects = defects.reduce((sum, d) => sum + (d.quantity || 1), 0);
+    
+    const inspectionResult = await client.query(`
+      INSERT INTO quality_inspections (
+        line_no, inspector_name, inspection_date, shift_slot, 
+        total_defects, total_checked_quantity, notes, created_at, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+      RETURNING id
+    `, [
+      lineNo,
+      inspectorName,
+      inspectionDate || new Date().toISOString().split('T')[0],
+      shiftSlot || null,
+      totalDefects,
+      totalCheckedQuantity || 0,
+      notes || null
+    ]);
+    
+    const inspectionId = inspectionResult.rows[0].id;
+    
+    for (const defect of defects) {
+      await client.query(`
+        INSERT INTO quality_defect_entries (
+          inspection_id, defect_type_id, defect_reason_id, 
+          defect_quantity, operation_name, operator_no, notes
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `, [
+        inspectionId,
+        defect.defectTypeId,
+        defect.defectReasonId || null,
+        defect.quantity || 1,
+        defect.operationName || null,
+        defect.operatorNo ? parseInt(defect.operatorNo) : null,
+        defect.notes || null
+      ]);
+    }
+    
+    // Also save the bad type / bad reason names on the quality_inspections row
+    // (aggregated, since one inspection can contain several defect types)
+    await client.query(`
+      UPDATE quality_inspections qi
+      SET bad_type = sub.types,
+          bad_reason = sub.reasons,
+          updated_at = NOW()
+      FROM (
+        SELECT
+          string_agg(DISTINCT dt.defect_code || ' - ' || dt.defect_name, '; ') AS types,
+          string_agg(DISTINCT dr.reason_code || ' - ' || dr.reason_description, '; ') AS reasons
+        FROM quality_defect_entries de
+        JOIN quality_defect_types dt ON de.defect_type_id = dt.id
+        LEFT JOIN quality_defect_reasons dr ON de.defect_reason_id = dr.id
+        WHERE de.inspection_id = $1
+      ) sub
+      WHERE qi.id = $1
+    `, [inspectionId]);
+    
+    await client.query("COMMIT");
+    
+    res.json({
+      success: true,
+      message: "Inspection saved successfully",
+      inspectionId: inspectionId,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error saving inspection:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * DELETE /api/quality/inspection/:inspectionId
+ * Delete an inspection
+ */
+app.delete("/api/quality/inspection/:inspectionId", authenticateToken, requireQualityInspector, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+    
+    const { inspectionId } = req.params;
+    
+    const checkResult = await client.query(
+      `SELECT id FROM quality_inspections WHERE id = $1`,
+      [inspectionId]
+    );
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Inspection not found" });
+    }
+    
+    await client.query(`DELETE FROM quality_inspections WHERE id = $1`, [inspectionId]);
+    
+    await client.query("COMMIT");
+    
+    res.json({
+      success: true,
+      message: "Inspection deleted successfully",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error deleting inspection:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/quality/run-operators/:runId
+ * Returns operators for a specific run
+ */
+app.get("/api/quality/run-operators/:runId", authenticateToken, requireQualityInspector, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { runId } = req.params;
+    
+    const result = await client.query(`
+      SELECT ro.id, ro.operator_no, ro.operator_name
+      FROM run_operators ro
+      WHERE ro.run_id = $1
+      ORDER BY ro.operator_no
+    `, [runId]);
+    
+    res.json({
+      success: true,
+      operators: result.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching run operators:", err.message);
+    res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
   }
