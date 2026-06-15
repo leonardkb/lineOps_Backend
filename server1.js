@@ -3182,6 +3182,163 @@ app.get("/api/quality/run-operators/:runId", authenticateToken, requireQualityIn
   }
 });
 
+/**
+ * GET /api/quality/analytics
+ * CEO analytical view of the quality_inspections table.
+ * Query params: startDate=YYYY-MM-DD, endDate=YYYY-MM-DD (defaults to today),
+ *   line (optional), style (optional).
+ * Returns aggregated defect data for the selected period.
+ */
+app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    if (!['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'quality_inspector'].includes(req.user?.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    const startDate = req.query.startDate || today;
+    const endDate = req.query.endDate || startDate;
+    const { line, style } = req.query;
+
+    // Build the optional line/style filter that applies to the inspections table (alias i)
+    const filters = [];
+    const params = [startDate, endDate];
+    let p = 3;
+    if (line && line !== 'all') { filters.push(`i.line_no = $${p++}`); params.push(line); }
+    if (style && style !== 'all') { filters.push(`i.style = $${p++}`); params.push(style); }
+    const extra = filters.length ? ` AND ${filters.join(' AND ')}` : '';
+    const dateWhere = `i.inspection_date BETWEEN $1 AND $2${extra}`;
+
+    // 1. Headline KPIs. Defect totals come from the entries; checked quantity is a
+    // per-inspection figure, so it is summed in a separate subquery to avoid the
+    // row multiplication caused by joining the entries table.
+    const summary = await client.query(`
+      SELECT
+        COALESCE((
+          SELECT SUM(de.defect_quantity)
+          FROM quality_defect_entries de
+          JOIN quality_inspections i ON de.inspection_id = i.id
+          WHERE ${dateWhere}
+        ), 0)::int                                AS total_defects,
+        COUNT(DISTINCT i.id)::int                  AS total_inspections,
+        COUNT(DISTINCT i.line_no)::int             AS active_lines,
+        COUNT(DISTINCT i.style)::int               AS active_styles,
+        COUNT(DISTINCT i.inspector_name)::int      AS active_inspectors,
+        COALESCE(SUM(i.total_checked_quantity), 0)::numeric AS total_checked
+      FROM quality_inspections i
+      WHERE ${dateWhere}
+    `, params);
+
+    // 2. Defects by line
+    const byLine = await client.query(`
+      SELECT i.line_no,
+             COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects,
+             COUNT(DISTINCT i.id)::int AS inspections
+      FROM quality_inspections i
+      LEFT JOIN quality_defect_entries de ON de.inspection_id = i.id
+      WHERE ${dateWhere}
+      GROUP BY i.line_no
+      ORDER BY total_defects DESC
+    `, params);
+
+    // 3. Defects by type
+    const byType = await client.query(`
+      SELECT dt.defect_code, dt.defect_name, dt.category,
+             COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
+      FROM quality_defect_entries de
+      JOIN quality_inspections i ON de.inspection_id = i.id
+      JOIN quality_defect_types dt ON de.defect_type_id = dt.id
+      WHERE ${dateWhere}
+      GROUP BY dt.id, dt.defect_code, dt.defect_name, dt.category
+      ORDER BY total_defects DESC
+    `, params);
+
+    // 4. Defects by reason
+    const byReason = await client.query(`
+      SELECT dr.reason_code, dr.reason_description, dt.defect_name,
+             COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
+      FROM quality_defect_entries de
+      JOIN quality_inspections i ON de.inspection_id = i.id
+      JOIN quality_defect_types dt ON de.defect_type_id = dt.id
+      LEFT JOIN quality_defect_reasons dr ON de.defect_reason_id = dr.id
+      WHERE ${dateWhere} AND dr.id IS NOT NULL
+      GROUP BY dr.id, dr.reason_code, dr.reason_description, dt.defect_name
+      ORDER BY total_defects DESC
+      LIMIT 15
+    `, params);
+
+    // 5. Defects by inspector
+    const byInspector = await client.query(`
+      SELECT i.inspector_name,
+             COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects,
+             COUNT(DISTINCT i.id)::int AS inspections
+      FROM quality_inspections i
+      LEFT JOIN quality_defect_entries de ON de.inspection_id = i.id
+      WHERE ${dateWhere}
+      GROUP BY i.inspector_name
+      ORDER BY total_defects DESC
+    `, params);
+
+    // 6. Defects by style
+    const byStyle = await client.query(`
+      SELECT COALESCE(i.style, 'Sin estilo') AS style,
+             COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
+      FROM quality_inspections i
+      LEFT JOIN quality_defect_entries de ON de.inspection_id = i.id
+      WHERE ${dateWhere}
+      GROUP BY i.style
+      ORDER BY total_defects DESC
+    `, params);
+
+    // 7. Hourly trend (intraday) based on entry creation time
+    const hourly = await client.query(`
+      SELECT to_char(de.created_at, 'HH24:00') AS hour,
+             COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
+      FROM quality_defect_entries de
+      JOIN quality_inspections i ON de.inspection_id = i.id
+      WHERE ${dateWhere}
+      GROUP BY to_char(de.created_at, 'HH24:00')
+      ORDER BY hour
+    `, params);
+
+    // 8. Detail rows for the table
+    const detail = await client.query(`
+      SELECT i.id,
+             to_char(i.inspection_date, 'YYYY-MM-DD') AS inspection_date,
+             i.line_no, i.style, i.inspector_name, i.shift_slot,
+             i.bad_type, i.bad_reason,
+             to_char(i.created_at AT TIME ZONE 'America/Mexico_City', 'HH24:MI') AS time,
+             COALESCE(SUM(de.defect_quantity), 0)::int AS total_defects
+      FROM quality_inspections i
+      LEFT JOIN quality_defect_entries de ON de.inspection_id = i.id
+      WHERE ${dateWhere}
+      GROUP BY i.id
+      ORDER BY i.created_at DESC
+    `, params);
+
+    res.json({
+      success: true,
+      range: { startDate, endDate },
+      summary: summary.rows[0],
+      byLine: byLine.rows,
+      byType: byType.rows,
+      byReason: byReason.rows,
+      byInspector: byInspector.rows,
+      byStyle: byStyle.rows,
+      hourly: hourly.rows,
+      detail: detail.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching quality analytics:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 // --------------------------------------------------------------
 // SUPERVISOR DASHBOARD ENDPOINTS (FIXED)
