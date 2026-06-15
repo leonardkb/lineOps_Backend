@@ -300,6 +300,7 @@ await client.query(`
   CREATE TABLE IF NOT EXISTS quality_inspections(
     id BIGSERIAL PRIMARY KEY,
     line_no TEXT NOT NULL,
+    style TEXT,
     inspector_name VARCHAR(100) NOT NULL,
     inspection_date DATE NOT NULL DEFAULT CURRENT_DATE,
     shift_slot VARCHAR(50),
@@ -315,6 +316,7 @@ await client.query(`
 // Add bad_type / bad_reason columns to existing databases (no-op if already present)
 await client.query("ALTER TABLE quality_inspections ADD COLUMN IF NOT EXISTS bad_type TEXT;");
 await client.query("ALTER TABLE quality_inspections ADD COLUMN IF NOT EXISTS bad_reason TEXT;");
+await client.query("ALTER TABLE quality_inspections ADD COLUMN IF NOT EXISTS style TEXT;");
 console.log("✅ quality_inspections table ready");
 
 // 9. Create quality_defect_types table (master data)
@@ -2893,6 +2895,7 @@ app.get("/api/quality/inspections/:lineNo", authenticateToken, requireQualityIns
     
     const result = await client.query(`
       SELECT i.*, 
+             to_char(i.inspection_date, 'YYYY-MM-DD') as inspection_date,
              COUNT(de.id) as total_defect_entries,
              COALESCE(SUM(de.defect_quantity), 0) as total_defects
       FROM quality_inspections i
@@ -3020,6 +3023,7 @@ app.post("/api/quality/inspection", authenticateToken, requireQualityInspector, 
     
     const { 
       lineNo, 
+      style,
       inspectorName, 
       inspectionDate,
       shiftSlot,
@@ -3039,13 +3043,14 @@ app.post("/api/quality/inspection", authenticateToken, requireQualityInspector, 
     
     const inspectionResult = await client.query(`
       INSERT INTO quality_inspections (
-        line_no, inspector_name, inspection_date, shift_slot, 
+        line_no, style, inspector_name, inspection_date, shift_slot, 
         total_defects, total_checked_quantity, notes, created_at, updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
       RETURNING id
     `, [
       lineNo,
+      style || null,
       inspectorName,
       inspectionDate || new Date().toISOString().split('T')[0],
       shiftSlot || null,
