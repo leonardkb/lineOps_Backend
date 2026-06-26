@@ -4911,6 +4911,192 @@ app.get("/api/supervisor/assignments", authenticateToken, requireSupervisor, asy
   }
 });
 
+// ========== PLANNER: EDIT OPERATION (SEWED QTY) ==========
+
+const requirePlanner = (req, res, next) => {
+  const allowedRoles = ["planner", "engineer", "supervisor", "soporte_it", "skyrina", "master", "inspector"];
+  if (!allowedRoles.includes(req.user?.role)) {
+    return res.status(403).json({
+      success: false,
+      error: "Access denied. Planner role required.",
+    });
+  }
+  next();
+};
+
+/**
+ * GET /api/planner/dates
+ * Distinct run dates that have runs (for the date dropdown)
+ */
+app.get("/api/planner/dates", authenticateToken, requirePlanner, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const result = await client.query(
+      `SELECT DISTINCT run_date FROM line_runs ORDER BY run_date DESC`
+    );
+    res.json({ success: true, dates: result.rows.map((r) => r.run_date) });
+  } catch (err) {
+    console.error("❌ /api/planner/dates error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/planner/lines?date=YYYY-MM-DD
+ * Lines (with run id + style) that have runs on the given date
+ */
+app.get("/api/planner/lines", authenticateToken, requirePlanner, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter required" });
+    }
+    const result = await client.query(
+      `SELECT id AS run_id, line_no, style
+         FROM line_runs
+        WHERE run_date = $1
+        ORDER BY line_no, style`,
+      [date]
+    );
+    res.json({ success: true, lines: result.rows });
+  } catch (err) {
+    console.error("❌ /api/planner/lines error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/planner/run/:runId/sewed
+ * Returns slots, operators, operations and the current sewed qty per slot
+ * so the planner can pick an operator/operation and edit produced (sewed) data.
+ */
+app.get("/api/planner/run/:runId/sewed", authenticateToken, requirePlanner, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { runId } = req.params;
+
+    const runResult = await client.query(
+      `SELECT id, line_no, run_date, style FROM line_runs WHERE id = $1`,
+      [runId]
+    );
+    if (runResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Run not found" });
+    }
+
+    const slotsResult = await client.query(
+      `SELECT id AS slot_id, slot_order, slot_label
+         FROM shift_slots
+        WHERE run_id = $1
+        ORDER BY slot_order`,
+      [runId]
+    );
+
+    const rowsResult = await client.query(
+      `SELECT ro.operator_no,
+              ro.operator_name,
+              oo.id AS operation_id,
+              oo.operation_name,
+              ss.id AS slot_id,
+              ss.slot_label,
+              ss.slot_order,
+              COALESCE(se.sewed_qty, 0) AS sewed_qty
+         FROM run_operators ro
+         JOIN operator_operations oo ON oo.run_operator_id = ro.id
+         CROSS JOIN shift_slots ss
+         LEFT JOIN operation_sewed_entries se
+                ON se.operation_id = oo.id AND se.slot_id = ss.id
+        WHERE ro.run_id = $1 AND oo.run_id = $1 AND ss.run_id = $1
+        ORDER BY ro.operator_no, oo.operation_name, ss.slot_order`,
+      [runId]
+    );
+
+    res.json({
+      success: true,
+      run: runResult.rows[0],
+      slots: slotsResult.rows,
+      rows: rowsResult.rows,
+    });
+  } catch (err) {
+    console.error("❌ /api/planner/run/sewed error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/planner/update-sewed/:runId
+ * body: { entries: [{ operatorNo, operationName, slotLabel, sewedQty }] }
+ * Updates the produced (sewed) quantities the line leader entered.
+ */
+app.post("/api/planner/update-sewed/:runId", authenticateToken, requirePlanner, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { runId } = req.params;
+    const { entries } = req.body;
+
+    if (!entries || !Array.isArray(entries)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "Missing entries array" });
+    }
+
+    let updatedCount = 0;
+
+    for (const entry of entries) {
+      const { operatorNo, operationName, slotLabel, sewedQty } = entry;
+      if (!operatorNo || !operationName || !slotLabel) continue;
+
+      const opResult = await client.query(
+        `SELECT o.id AS op_id
+           FROM operator_operations o
+           JOIN run_operators ro ON o.run_operator_id = ro.id
+          WHERE o.run_id = $1 AND ro.operator_no = $2 AND o.operation_name = $3
+          LIMIT 1`,
+        [runId, parseInt(operatorNo), operationName]
+      );
+      if (opResult.rows.length === 0) continue;
+      const operationId = opResult.rows[0].op_id;
+
+      const slotResult = await client.query(
+        `SELECT id FROM shift_slots WHERE run_id = $1 AND slot_label = $2 LIMIT 1`,
+        [runId, slotLabel]
+      );
+      if (slotResult.rows.length === 0) continue;
+      const slotId = slotResult.rows[0].id;
+
+      await client.query(
+        `INSERT INTO operation_sewed_entries (run_id, operation_id, slot_id, sewed_qty, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, now(), now())
+         ON CONFLICT (operation_id, slot_id)
+         DO UPDATE SET sewed_qty = EXCLUDED.sewed_qty, updated_at = now()`,
+        [runId, operationId, slotId, Number(sewedQty || 0)]
+      );
+      updatedCount++;
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, updatedCount });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ /api/planner/update-sewed error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 // ----------------------------------------------------------------------
 // 18. USER MANAGEMENT
 // ----------------------------------------------------------------------
