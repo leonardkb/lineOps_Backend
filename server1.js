@@ -3481,10 +3481,12 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
 // --------------------------------------------------------------
 
 const requireSupervisor = (req, res, next) => {
-  if (req.user.role !== "supervisor" && req.user.role !== "soporte_it" && req.user.role !== "skyrina" && req.user.role !== "master") {
+  if (req.user.role !== "supervisor" && req.user.role !== "skyrina"&& req.user.role !== "admin"
+    && req.user.role !== "master"
+  ) {
     return res.status(403).json({
       success: false,
-      error: "Access denied. Supervisor, IT Support, Skyrina, or Master role required.",
+      error: "Access denied. Supervisor role required.",
     });
   }
   next();
@@ -3514,7 +3516,10 @@ app.get("/api/supervisor/summary", authenticateToken, requireSupervisor, async (
     );
     const totalTarget = parseFloat(targetResult.rows[0].total_target) || 0;
 
-  // 2) Total sewed (finished garments) – sum of packing operation outputs
+    // 2) Total sewed – per operator per line: max of operation totals, then sum across lines
+    // In /api/supervisor/summary, after totalTarget calculation:
+
+// 2) Total sewed (finished garments) – sum of packing operation outputs
 const sewedResult = await client.query(
   `SELECT COALESCE(SUM(se.sewed_qty), 0) AS total_sewed
    FROM line_runs lr
@@ -3526,8 +3531,6 @@ const sewedResult = await client.query(
   [date]
 );
 const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
-// 👇 ADD THIS LOG
-console.log(`[DEBUG] Summary for ${date}: totalSewed = ${totalSewed}`);
 
     // 3) Total operators – distinct count
     const operatorsResult = await client.query(
@@ -3539,8 +3542,7 @@ console.log(`[DEBUG] Summary for ${date}: totalSewed = ${totalSewed}`);
     );
     const totalOperators = parseInt(operatorsResult.rows[0].total_operators) || 0;
 
-    // 4) Efficiency – using bottleneck per run (min pieces) to count garments correctly
-      // 4) Efficiency – using packing output (finished garments) to count total SAM produced
+   // 4) Efficiency – using packing output (finished garments) to count total SAM produced
 const efficiencyResult = await client.query(
   `
   WITH run_available_minutes AS (
@@ -3571,7 +3573,6 @@ const efficiencyResult = await client.query(
 `,
   [date]
 );
-
     const row = efficiencyResult.rows[0];
     const totalSamOutput = parseFloat(row.total_sam_output) || 0;
     const totalAvailableMinutes = parseFloat(row.total_available_minutes) || 0;
@@ -3659,120 +3660,7 @@ app.get("/api/supervisor/alert-count", authenticateToken, requireSupervisor, asy
  * GET /api/supervisor/line-performance?date=YYYY-MM-DD
  * Returns per-line: line_no, totalTarget, totalSewed, achievement, operators
  */
-
-app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await setSchema(client);
-
-    const { date } = req.query;
-    if (!date) {
-      return res.status(400).json({ success: false, error: "date parameter required" });
-    }
-
-    // Current time in the server's timezone (you may want to use client time later)
-    const now = new Date();
-    const todayStr = date; // YYYY-MM-DD
-
-    const query = `
-      WITH line_targets AS (
-        SELECT lr.id AS run_id, lr.line_no, lr.target_pcs AS total_target
-        FROM line_runs lr
-        WHERE lr.run_date = $1
-      ),
-      -- Get all slots with their targets for each line
-      line_slots AS (
-        SELECT
-          lt.line_no,
-          ss.slot_start,
-          ss.slot_end,
-          st.slot_target
-        FROM line_targets lt
-        JOIN shift_slots ss ON lt.run_id = ss.run_id
-        LEFT JOIN slot_targets st ON ss.id = st.slot_id
-        WHERE ss.slot_start IS NOT NULL AND ss.slot_end IS NOT NULL
-      ),
-      -- Compute real‑time cumulative for each line
-      line_realtime AS (
-        SELECT
-          line_no,
-          SUM(
-            CASE
-              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_end)::timestamp) THEN slot_target
-              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_start)::timestamp)
-                   AND $2::timestamp AT TIME ZONE 'UTC' < (($1 || ' ' || slot_end)::timestamp)
-              THEN slot_target * (
-                EXTRACT(EPOCH FROM ($2::timestamp AT TIME ZONE 'UTC' - ($1 || ' ' || slot_start)::timestamp)) /
-                EXTRACT(EPOCH FROM (($1 || ' ' || slot_end)::timestamp - ($1 || ' ' || slot_start)::timestamp))
-              )
-              ELSE 0
-            END
-          ) AS realtime_target
-        FROM line_slots
-        GROUP BY line_no
-      ),
-      operator_production AS (
-        SELECT 
-          lr.line_no,
-          ro.operator_no,
-          COALESCE(SUM(se.sewed_qty), 0) AS operator_production
-        FROM line_runs lr
-        JOIN run_operators ro ON lr.id = ro.run_id
-        JOIN operator_operations oo ON ro.id = oo.run_operator_id
-        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-        WHERE lr.run_date = $1
-          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
-        GROUP BY lr.line_no, ro.operator_no
-      ),
-      line_sewed AS (
-        SELECT line_no, SUM(operator_production) AS total_sewed
-        FROM operator_production
-        GROUP BY line_no
-      ),
-      line_operators AS (
-        SELECT lr.line_no, COUNT(DISTINCT ro.operator_no) AS operators_count
-        FROM line_runs lr
-        JOIN run_operators ro ON lr.id = ro.run_id
-        WHERE lr.run_date = $1
-        GROUP BY lr.line_no
-      )
-      SELECT 
-        lt.line_no,
-        lt.total_target,
-        COALESCE(ls.total_sewed, 0) AS total_sewed,
-        COALESCE(lo.operators_count, 0) AS operators_count,
-        COALESCE(lr.realtime_target, 0) AS realtime_target,
-        CASE 
-          WHEN lt.total_target > 0 
-          THEN (COALESCE(ls.total_sewed, 0) / lt.total_target) * 100 
-          ELSE 0 
-        END AS achievement
-      FROM line_targets lt
-      LEFT JOIN line_sewed ls ON lt.line_no = ls.line_no
-      LEFT JOIN line_operators lo ON lt.line_no = lo.line_no
-      LEFT JOIN line_realtime lr ON lt.line_no = lr.line_no
-      ORDER BY lt.line_no;
-    `;
-
-    const result = await client.query(query, [date, now]);
-
-    const lines = result.rows.map((row) => ({
-      lineNo: row.line_no,
-      totalTarget: parseFloat(row.total_target) || 0,
-      totalSewed: parseFloat(row.total_sewed) || 0,
-      operators: parseInt(row.operators_count) || 0,
-      realtimeTarget: Math.round(parseFloat(row.realtime_target) * 100) / 100, // two decimals
-      achievement: Math.round((parseFloat(row.achievement) || 0) * 100) / 100,
-    }));
-
-    res.json({ success: true, date, lines });
-  } catch (err) {
-    console.error("❌ /api/supervisor/line-performance error:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
+// In server.js, replace the /api/supervisor/line-performance endpoint with this version
 
 app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor, async (req, res) => {
   const client = await pool.connect();
@@ -5021,6 +4909,8 @@ app.get("/api/skyrina/product-performance", authenticateToken, async (req, res) 
     client.release();
   }
 });
+
+// Add this endpoint to your server.js (without validate)
 // ========== BATCH ENDPOINT FOR SKYRINA DASHBOARD ==========
 app.post(
   "/api/batch/line-runs-data",
@@ -5056,7 +4946,7 @@ app.post(
         const lineRuns = [];
         
         for (const run of runsResult.rows) {
-          // Get full run data using the helper function
+          // Get full run data
           const runData = await getFullRunDataBatch(client, run.id);
           lineRuns.push({
             ...run,
@@ -5077,24 +4967,17 @@ app.post(
   }
 );
 
-// ========== HELPER FUNCTION FOR BATCH ENDPOINT ==========
-// Single, clean version - no duplicates!
+// Helper function for batch endpoint (different name to avoid conflict)
 async function getFullRunDataBatch(client, runId) {
   // Get slots
   const slotsResult = await client.query(
-    `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours 
-     FROM shift_slots 
-     WHERE run_id = $1 
-     ORDER BY slot_order`,
+    "SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours FROM shift_slots WHERE run_id = $1 ORDER BY slot_order",
     [runId]
   );
   
   // Get operators
   const operatorsResult = await client.query(
-    `SELECT id, operator_no, operator_name 
-     FROM run_operators 
-     WHERE run_id = $1 
-     ORDER BY operator_no`,
+    "SELECT id, operator_no, operator_name FROM run_operators WHERE run_id = $1 ORDER BY operator_no",
     [runId]
   );
   
@@ -5110,7 +4993,6 @@ async function getFullRunDataBatch(client, runId) {
   
   // Get operations with their data
   const operationsData = [];
-  
   for (const operator of operatorsResult.rows) {
     const operationsResult = await client.query(
       `SELECT 
@@ -5148,11 +5030,7 @@ async function getFullRunDataBatch(client, runId) {
     );
     
     operationsData.push({
-      operator: {
-        id: operator.id,
-        operator_no: operator.operator_no,
-        operator_name: operator.operator_name
-      },
+      operator,
       operations: operationsResult.rows,
     });
   }
@@ -5164,6 +5042,86 @@ async function getFullRunDataBatch(client, runId) {
     slotTargets: slotTargetsResult.rows,
   };
 }
+
+// Add the helper function getFullRunData
+
+
+// Helper function to get full run data
+async function getFullRunData(client, runId) {
+  // Get slots
+  const slotsResult = await client.query(
+    "SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours FROM shift_slots WHERE run_id = $1 ORDER BY slot_order",
+    [runId]
+  );
+  
+  // Get operators
+  const operatorsResult = await client.query(
+    "SELECT id, operator_no, operator_name FROM run_operators WHERE run_id = $1 ORDER BY operator_no",
+    [runId]
+  );
+  
+  // Get slot targets
+  const slotTargetsResult = await client.query(
+    `SELECT s.slot_label, t.slot_target, t.cumulative_target
+     FROM slot_targets t
+     JOIN shift_slots s ON t.slot_id = s.id
+     WHERE t.run_id = $1
+     ORDER BY s.slot_order`,
+    [runId]
+  );
+  
+  // Get operations with their data
+  const operationsData = [];
+  for (const operator of operatorsResult.rows) {
+    const operationsResult = await client.query(
+      `SELECT 
+        o.id,
+        o.operation_name,
+        o.t1_sec,
+        o.t2_sec,
+        o.t3_sec,
+        o.t4_sec,
+        o.t5_sec,
+        o.capacity_per_hour,
+        COALESCE(
+          jsonb_object_agg(
+            COALESCE(s.slot_label, ''),
+            COALESCE(h.stitched_qty, 0)
+          ) FILTER (WHERE s.slot_label IS NOT NULL),
+          '{}'::jsonb
+        ) as stitched_data,
+        COALESCE(
+          jsonb_object_agg(
+            COALESCE(s2.slot_label, ''),
+            COALESCE(se.sewed_qty, 0)
+          ) FILTER (WHERE s2.slot_label IS NOT NULL),
+          '{}'::jsonb
+        ) as sewed_data
+       FROM operator_operations o
+       LEFT JOIN operation_hourly_entries h ON o.id = h.operation_id
+       LEFT JOIN shift_slots s ON h.slot_id = s.id
+       LEFT JOIN operation_sewed_entries se ON o.id = se.operation_id
+       LEFT JOIN shift_slots s2 ON se.slot_id = s2.id
+       WHERE o.run_operator_id = $1 AND o.run_id = $2
+       GROUP BY o.id
+       ORDER BY o.created_at`,
+      [operator.id, runId]
+    );
+    
+    operationsData.push({
+      operator,
+      operations: operationsResult.rows,
+    });
+  }
+  
+  return {
+    slots: slotsResult.rows,
+    operators: operatorsResult.rows,
+    operations: operationsData,
+    slotTargets: slotTargetsResult.rows,
+  };
+}
+
 // ----------------------------------------------------------------------
 // 15. ENGINEER LINE BALANCING ENDPOINTS
 // ----------------------------------------------------------------------
