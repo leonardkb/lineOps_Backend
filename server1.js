@@ -736,7 +736,7 @@ app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
-const registerMechanicsSummary = require("./mechanics-summary");
+const registerMechanicsSummary = require("./mecanics-summary");
 registerMechanicsSummary(app, authenticateToken);
 
 
