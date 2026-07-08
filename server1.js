@@ -736,6 +736,10 @@ app.get("/api/me", authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
+const registerMechanicsSummary = require("./mechanics-summary");
+registerMechanicsSummary(app, authenticateToken);
+
+
 app.post("/api/logout", (req, res) => {
   res.json({ success: true, message: "Logged out successfully" });
 });
