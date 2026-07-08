@@ -3481,12 +3481,10 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
 // --------------------------------------------------------------
 
 const requireSupervisor = (req, res, next) => {
-  if (req.user.role !== "supervisor" && req.user.role !== "skyrina"&& req.user.role !== "admin"
-    && req.user.role !== "master"
-  ) {
+  if (req.user.role !== "supervisor" && req.user.role !== "soporte_it" && req.user.role !== "skyrina" && req.user.role !== "master") {
     return res.status(403).json({
       success: false,
-      error: "Access denied. Supervisor role required.",
+      error: "Access denied. Supervisor, IT Support, Skyrina, or Master role required.",
     });
   }
   next();
@@ -3516,10 +3514,7 @@ app.get("/api/supervisor/summary", authenticateToken, requireSupervisor, async (
     );
     const totalTarget = parseFloat(targetResult.rows[0].total_target) || 0;
 
-    // 2) Total sewed – per operator per line: max of operation totals, then sum across lines
-    // In /api/supervisor/summary, after totalTarget calculation:
-
-// 2) Total sewed (finished garments) – sum of packing operation outputs
+  // 2) Total sewed (finished garments) – sum of packing operation outputs
 const sewedResult = await client.query(
   `SELECT COALESCE(SUM(se.sewed_qty), 0) AS total_sewed
    FROM line_runs lr
@@ -3531,6 +3526,8 @@ const sewedResult = await client.query(
   [date]
 );
 const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
+// 👇 ADD THIS LOG
+console.log(`[DEBUG] Summary for ${date}: totalSewed = ${totalSewed}`);
 
     // 3) Total operators – distinct count
     const operatorsResult = await client.query(
@@ -3542,7 +3539,8 @@ const totalSewed = parseFloat(sewedResult.rows[0].total_sewed) || 0;
     );
     const totalOperators = parseInt(operatorsResult.rows[0].total_operators) || 0;
 
-   // 4) Efficiency – using packing output (finished garments) to count total SAM produced
+    ly
+// 4) Efficiency – using packing output (finished garments) to count total SAM produced
 const efficiencyResult = await client.query(
   `
   WITH run_available_minutes AS (
@@ -3573,6 +3571,7 @@ const efficiencyResult = await client.query(
 `,
   [date]
 );
+
     const row = efficiencyResult.rows[0];
     const totalSamOutput = parseFloat(row.total_sam_output) || 0;
     const totalAvailableMinutes = parseFloat(row.total_available_minutes) || 0;
@@ -3660,7 +3659,120 @@ app.get("/api/supervisor/alert-count", authenticateToken, requireSupervisor, asy
  * GET /api/supervisor/line-performance?date=YYYY-MM-DD
  * Returns per-line: line_no, totalTarget, totalSewed, achievement, operators
  */
-// In server.js, replace the /api/supervisor/line-performance endpoint with this version
+
+app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter required" });
+    }
+
+    // Current time in the server's timezone (you may want to use client time later)
+    const now = new Date();
+    const todayStr = date; // YYYY-MM-DD
+
+    const query = `
+      WITH line_targets AS (
+        SELECT lr.id AS run_id, lr.line_no, lr.target_pcs AS total_target
+        FROM line_runs lr
+        WHERE lr.run_date = $1
+      ),
+      -- Get all slots with their targets for each line
+      line_slots AS (
+        SELECT
+          lt.line_no,
+          ss.slot_start,
+          ss.slot_end,
+          st.slot_target
+        FROM line_targets lt
+        JOIN shift_slots ss ON lt.run_id = ss.run_id
+        LEFT JOIN slot_targets st ON ss.id = st.slot_id
+        WHERE ss.slot_start IS NOT NULL AND ss.slot_end IS NOT NULL
+      ),
+      -- Compute real‑time cumulative for each line
+      line_realtime AS (
+        SELECT
+          line_no,
+          SUM(
+            CASE
+              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_end)::timestamp) THEN slot_target
+              WHEN $2::timestamp AT TIME ZONE 'UTC' >= (($1 || ' ' || slot_start)::timestamp)
+                   AND $2::timestamp AT TIME ZONE 'UTC' < (($1 || ' ' || slot_end)::timestamp)
+              THEN slot_target * (
+                EXTRACT(EPOCH FROM ($2::timestamp AT TIME ZONE 'UTC' - ($1 || ' ' || slot_start)::timestamp)) /
+                EXTRACT(EPOCH FROM (($1 || ' ' || slot_end)::timestamp - ($1 || ' ' || slot_start)::timestamp))
+              )
+              ELSE 0
+            END
+          ) AS realtime_target
+        FROM line_slots
+        GROUP BY line_no
+      ),
+      operator_production AS (
+        SELECT 
+          lr.line_no,
+          ro.operator_no,
+          COALESCE(SUM(se.sewed_qty), 0) AS operator_production
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE lr.run_date = $1
+          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+        GROUP BY lr.line_no, ro.operator_no
+      ),
+      line_sewed AS (
+        SELECT line_no, SUM(operator_production) AS total_sewed
+        FROM operator_production
+        GROUP BY line_no
+      ),
+      line_operators AS (
+        SELECT lr.line_no, COUNT(DISTINCT ro.operator_no) AS operators_count
+        FROM line_runs lr
+        JOIN run_operators ro ON lr.id = ro.run_id
+        WHERE lr.run_date = $1
+        GROUP BY lr.line_no
+      )
+      SELECT 
+        lt.line_no,
+        lt.total_target,
+        COALESCE(ls.total_sewed, 0) AS total_sewed,
+        COALESCE(lo.operators_count, 0) AS operators_count,
+        COALESCE(lr.realtime_target, 0) AS realtime_target,
+        CASE 
+          WHEN lt.total_target > 0 
+          THEN (COALESCE(ls.total_sewed, 0) / lt.total_target) * 100 
+          ELSE 0 
+        END AS achievement
+      FROM line_targets lt
+      LEFT JOIN line_sewed ls ON lt.line_no = ls.line_no
+      LEFT JOIN line_operators lo ON lt.line_no = lo.line_no
+      LEFT JOIN line_realtime lr ON lt.line_no = lr.line_no
+      ORDER BY lt.line_no;
+    `;
+
+    const result = await client.query(query, [date, now]);
+
+    const lines = result.rows.map((row) => ({
+      lineNo: row.line_no,
+      totalTarget: parseFloat(row.total_target) || 0,
+      totalSewed: parseFloat(row.total_sewed) || 0,
+      operators: parseInt(row.operators_count) || 0,
+      realtimeTarget: Math.round(parseFloat(row.realtime_target) * 100) / 100, // two decimals
+      achievement: Math.round((parseFloat(row.achievement) || 0) * 100) / 100,
+    }));
+
+    res.json({ success: true, date, lines });
+  } catch (err) {
+    console.error("❌ /api/supervisor/line-performance error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor, async (req, res) => {
   const client = await pool.connect();
@@ -4385,10 +4497,6 @@ app.get("/api/skyrina/available-lines", authenticateToken, async (req, res) => {
 
 /**
  * GET /api/skyrina/period-summary?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
- * Returns aggregated summary for a date range with filters
- */
-/**
- * GET /api/skyrina/period-summary?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
  * Returns aggregated summary for a date range with CORRECT efficiency calculation
  * Uses weighted average based on total SAM output vs total available minutes
  */
@@ -4409,52 +4517,63 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
     
-    let query = `
-      WITH packing_sewed AS (
-        SELECT 
-          lr.id as run_id,
-          lr.line_no,
-          lr.target_pcs,
+    // Build optional filters that apply to the ALL-RUNS available-minutes set,
+    // so the denominator matches the proven-correct query (identical to the pgAdmin result).
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    let runFilters = "";
+
+    if (style && style !== 'all') {
+      runFilters += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+
+    if (lineNo && lineNo !== 'all') {
+      runFilters += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+
+    // CORRECT global (diario) efficiency:
+    //   available minutes are summed over EVERY run on the date (matching the working query),
+    //   NOT only over runs that happen to contain a packing operation.
+    const query = `
+      WITH filtered_runs AS (
+        SELECT
+          lr.id            AS run_id,
+          lr.line_no       AS line_no,
+          lr.target_pcs    AS target_pcs,
           lr.operators_count,
           lr.working_hours,
           lr.sam_minutes,
-          COALESCE(SUM(se.sewed_qty), 0) as total_sewed
+          (lr.working_hours * lr.operators_count * 60) AS available_minutes
         FROM line_runs lr
-        LEFT JOIN run_operators ro ON lr.id = ro.run_id
-        LEFT JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
+      ),
+      run_packing_totals AS (
+        SELECT
+          fr.run_id,
+          fr.sam_minutes,
+          COALESCE(SUM(se.sewed_qty), 0) AS packing_total
+        FROM filtered_runs fr
+        JOIN run_operators ro ON fr.run_id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
         LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-        WHERE lr.run_date BETWEEN $1 AND $2
-          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%' OR oo.operation_name IS NULL)
-    `;
-    
-    const params = [startDate, endDate];
-    let paramIndex = 3;
-    
-    if (style && style !== 'all') {
-      query += ` AND lr.style = $${paramIndex++}`;
-      params.push(style);
-    }
-    
-    if (lineNo && lineNo !== 'all') {
-      query += ` AND lr.line_no = $${paramIndex++}`;
-      params.push(lineNo);
-    }
-    
-    query += `
-        GROUP BY lr.id, lr.line_no, lr.target_pcs, lr.operators_count, lr.working_hours, lr.sam_minutes
+        WHERE (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+        GROUP BY fr.run_id, fr.sam_minutes
       )
-      SELECT 
-        COUNT(DISTINCT run_id) as total_runs,
-        COUNT(DISTINCT line_no) as lines_used,
-        COALESCE(SUM(total_sewed), 0) as total_sewed,
-        COALESCE(SUM(target_pcs), 0) as total_target,
-        -- CORRECT EFFICIENCY: Total SAM output / Total available minutes (NO ROUNDING)
-        CASE 
-          WHEN SUM(operators_count * working_hours * 60) > 0 
-          THEN (SUM(total_sewed * sam_minutes) / SUM(operators_count * working_hours * 60)) * 100
+      SELECT
+        (SELECT COUNT(*) FROM filtered_runs)                             AS total_runs,
+        (SELECT COUNT(DISTINCT line_no) FROM filtered_runs)             AS lines_used,
+        COALESCE((SELECT SUM(packing_total) FROM run_packing_totals),0) AS total_sewed,
+        COALESCE((SELECT SUM(target_pcs) FROM filtered_runs),0)         AS total_target,
+        CASE
+          WHEN (SELECT SUM(available_minutes) FROM filtered_runs) > 0
+          THEN (
+                 COALESCE((SELECT SUM(packing_total * sam_minutes) FROM run_packing_totals),0)
+                 / (SELECT SUM(available_minutes) FROM filtered_runs)
+               ) * 100
           ELSE 0
-        END as avg_efficiency
-      FROM packing_sewed
+        END                                                             AS avg_efficiency
     `;
     
     const result = await client.query(query, params);
