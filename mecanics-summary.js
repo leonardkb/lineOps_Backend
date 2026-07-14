@@ -60,6 +60,14 @@ function isValidWeek(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(Date.parse(s));
 }
 
+// YYYY-MM (month) and YYYY (year) validators for the period selector.
+function isValidMonth(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}$/.test(s);
+}
+function isValidYear(s) {
+  return typeof s === "string" && /^\d{4}$/.test(s);
+}
+
 // One fetch with a timeout + auth header + JSON parsing, with useful errors.
 async function awsGet(path) {
   const controller = new AbortController();
@@ -121,57 +129,128 @@ module.exports = function registerMechanicsSummary(app, authenticateToken) {
         });
       }
 
-      // Optional ?semana=YYYY-MM-DD, defaults to this week's Monday.
-      const semana = isValidWeek(req.query.semana) ? req.query.semana : currentWeekMonday();
+      // Period selector: ?tipo=semana|mes|anio & ?valor=...
+      // Back-compat: a bare ?semana=YYYY-MM-DD still works (treated as tipo=semana).
+      let tipo = (req.query.tipo || "semana").toLowerCase();
+      let valor = req.query.valor;
 
-      // Fire all AWS calls in parallel.
-      const [bonos, supervisor, perf] = await Promise.all([
-        awsGet(`/rh/bonos/semana/${semana}`),
-        awsGet(`/supervisor/dashboard/stats`),
-        awsGet(`/supervisor/mechanics/performance`),
-      ]);
+      if (tipo === "semana") {
+        // ---- WEEK VIEW (unchanged behavior) -------------------------------
+        const semana =
+          isValidWeek(valor) ? valor
+          : isValidWeek(req.query.semana) ? req.query.semana
+          : currentWeekMonday();
 
-      const mecanicos = Array.isArray(bonos.mecanicos) ? bonos.mecanicos : [];
-      const stats = supervisor.stats || {};
+        // Fire all AWS calls in parallel.
+        const [bonos, supervisor, perf] = await Promise.all([
+          awsGet(`/rh/bonos/semana/${semana}`),
+          awsGet(`/supervisor/dashboard/stats`),
+          awsGet(`/supervisor/mechanics/performance`),
+        ]);
 
-      // Per-mechanic performance, keyed by id for merging.
-      // NOTE: avg_resolution_minutes here is ALL-TIME (across every ticket the
-      // mechanic has closed), not just the selected week — the weekly bono route
-      // doesn't expose a per-mechanic time. Labelled accordingly in the UI.
-      const perfById = {};
-      for (const p of Array.isArray(perf.mechanics) ? perf.mechanics : []) {
-        perfById[p.mecanico_id] = p;
+        const mecanicos = Array.isArray(bonos.mecanicos) ? bonos.mecanicos : [];
+        const stats = supervisor.stats || {};
+
+        // Per-mechanic performance, keyed by id for merging.
+        // NOTE: avg_resolution_minutes here is ALL-TIME (across every ticket the
+        // mechanic has closed), not just the selected week — the weekly bono route
+        // doesn't expose a per-mechanic time. Labelled accordingly in the UI.
+        const perfById = {};
+        for (const p of Array.isArray(perf.mechanics) ? perf.mechanics : []) {
+          perfById[p.mecanico_id] = p;
+        }
+
+        const mechanics = mecanicos.map((m) => ({
+          id: m.id,
+          name: m.nombre,
+          location: m.asignacion,
+          ticketsAssigned: m.tickets_asignados,
+          ticketsClosed: m.tickets_cerrados,
+          bonusMxn: effectiveBonus(m),
+          bonusCalculatedMxn: m.monto_bono_mxn,
+          bonusFinalMxn: m.monto_final_mxn,
+          bonusPct: m.bono_pct,
+          avgCloseMinutes: perfById[m.id]?.avg_resolution_minutes ?? null, // all-time avg
+          delayedTickets: perfById[m.id]?.delayed_tickets ?? null,         // all-time delayed
+        }));
+
+        const totalBonusAllMechanics = mechanics.reduce((sum, m) => sum + (m.bonusMxn || 0), 0);
+
+        return res.json({
+          success: true,
+          tipo: "semana",
+          valor: semana,
+          semana,                                   // kept for back-compat
+          periodLabel: semana,
+          avgCloseScope: "historico",               // all-time avg close time
+          weekBonoClosed: bonos.cerrado === true,
+          global: {
+            ticketsCreated: stats.totalTickets,
+            ticketsClosed: stats.closedTickets,
+            activeTickets: stats.activeTickets,
+            pendingValidation: stats.pendingValidation,
+            avgClosingMinutes: stats.avgClosing,
+            totalBonusAllMechanics,
+          },
+          mechanics,
+        });
       }
 
-      // Per-mechanic, renamed to clean camelCase for the frontend.
+      // ---- MONTH / YEAR VIEW (new period rollup) --------------------------
+      if (tipo !== "mes" && tipo !== "anio") {
+        return res.status(400).json({ success: false, error: "tipo inválido (usa semana | mes | anio)." });
+      }
+      if (tipo === "mes" && !isValidMonth(valor)) {
+        return res.status(400).json({ success: false, error: "valor inválido para mes (usa YYYY-MM)." });
+      }
+      if (tipo === "anio" && !isValidYear(valor)) {
+        return res.status(400).json({ success: false, error: "valor inválido para año (usa YYYY)." });
+      }
+
+      // The periodo route gives period-scoped tickets + summed weekly bonus.
+      // Supervisor stats supplies only the live "activos / por validar" snapshot,
+      // which is inherently a right-now number (not period-scoped).
+      const [periodo, supervisor] = await Promise.all([
+        awsGet(`/rh/bonos/periodo/${tipo}/${valor}`),
+        awsGet(`/supervisor/dashboard/stats`),
+      ]);
+
+      const mecanicos = Array.isArray(periodo.mecanicos) ? periodo.mecanicos : [];
+      const stats = supervisor.stats || {};
+      const pg = periodo.global || {};
+
       const mechanics = mecanicos.map((m) => ({
         id: m.id,
         name: m.nombre,
-        location: m.asignacion,                 // piso | taller | muestras
-        ticketsAssigned: m.tickets_asignados,   // assigned to this mechanic (this week)
-        ticketsClosed: m.tickets_cerrados,       // closed by this mechanic (this week)
-        bonusMxn: effectiveBonus(m),             // final if adjusted, else calculated
-        bonusCalculatedMxn: m.monto_bono_mxn,    // raw calculated amount
-        bonusFinalMxn: m.monto_final_mxn,        // null until RH adjusts it
-        bonusPct: m.bono_pct,
-        avgCloseMinutes: perfById[m.id]?.avg_resolution_minutes ?? null, // all-time avg
-        delayedTickets: perfById[m.id]?.delayed_tickets ?? null,         // all-time delayed
+        location: m.asignacion,
+        ticketsAssigned: m.tickets_asignados,        // created in period
+        ticketsClosed: m.tickets_cerrados,           // closed in period
+        bonusMxn: effectiveBonus(m),                 // summed weekly effective
+        bonusCalculatedMxn: m.monto_calculado_mxn,   // summed weekly calculated
+        bonusFinalMxn: m.monto_final_mxn,            // summed weekly final (null if none set)
+        bonusPct: m.bono_pct,                        // avg weekly %
+        avgCloseMinutes: m.avg_resolution_minutes ?? null, // avg within period
+        delayedTickets: m.delayed_tickets ?? null,         // delayed within period
       }));
-
-      // Total bonus across all mechanics for the week (sum of effective amounts).
-      const totalBonusAllMechanics = mechanics.reduce((sum, m) => sum + (m.bonusMxn || 0), 0);
 
       return res.json({
         success: true,
-        semana,
-        weekBonoClosed: bonos.cerrado === true, // whether RH has locked this week
+        tipo,
+        valor,
+        desde: periodo.desde,
+        hasta: periodo.hasta,
+        periodLabel: valor,
+        avgCloseScope: "periodo",                    // period-scoped avg close time
+        weekBonoClosed: false,                        // not applicable for month/year
+        bonusWeeksConfirmed: pg.semanas_confirmadas ?? null,
+        bonusWeeksOpen: pg.semanas_abiertas ?? null,  // open weeks NOT counted in bonus
         global: {
-          ticketsCreated: stats.totalTickets,       // all non-cancelled tickets in system
-          ticketsClosed: stats.closedTickets,       // globally closed
-          activeTickets: stats.activeTickets,
-          pendingValidation: stats.pendingValidation,
-          avgClosingMinutes: stats.avgClosing,
-          totalBonusAllMechanics,                   // summed per-mechanic (this week)
+          ticketsCreated: pg.tickets_creados,
+          ticketsClosed: pg.tickets_cerrados,
+          activeTickets: stats.activeTickets,          // live snapshot
+          pendingValidation: stats.pendingValidation,  // live snapshot
+          avgClosingMinutes: pg.avg_closing_minutes,
+          totalBonusAllMechanics: pg.total_bono_mxn,
         },
         mechanics,
       });
