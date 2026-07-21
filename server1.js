@@ -764,6 +764,7 @@ app.post(
     body("slots").isArray({ min: 1 }).withMessage("At least one shift slot required"),
     body("slots.*.label").notEmpty().withMessage("Slot label required"),
     body("slots.*.hours").isFloat({ min: 0 }).withMessage("Planned hours must be non‑negative"),
+    body("workOrderId").optional({ nullable: true }).isInt({ min: 1 }).withMessage("workOrderId must be a positive integer"),
   ]),
   async (req, res, next) => {
     const client = await pool.connect();
@@ -771,11 +772,11 @@ app.post(
       await setSchema(client);
       await client.query("BEGIN");
 
-      const { line, date, style, operators, workingHours, sam, efficiency, target, targetPerHour, slots } = req.body;
+      const { line, date, style, operators, workingHours, sam, efficiency, target, targetPerHour, slots, workOrderId } = req.body;
 
       const lineRunResult = await client.query(
-        `INSERT INTO line_runs (line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+        `INSERT INTO line_runs (line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
          RETURNING id`,
         [
           line,
@@ -787,6 +788,7 @@ app.post(
           parseFloat(efficiency) || 0.7,
           parseFloat(target) || 0,
           parseFloat(targetPerHour) || 0,
+          workOrderId || null,
         ]
       );
 
@@ -1096,7 +1098,13 @@ app.get("/api/get-run-data/:runId", authenticateToken, async (req, res, next) =>
     await setSchema(client);
     const { runId } = req.params;
 
-    const runResult = await client.query("SELECT * FROM line_runs WHERE id = $1", [runId]);
+     const runResult = await client.query(
+  `SELECT lr.*, wo.work_order_no
+   FROM line_runs lr
+   LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
+   WHERE lr.id = $1`,
+  [runId]
+);
     if (runResult.rows.length === 0) return res.status(404).json({ success: false, error: "Run not found" });
 
     const slotsResult = await client.query(
@@ -1523,7 +1531,7 @@ app.get("/api/run/:runId", async (req, res) => {
     const { runId } = req.params;
 
     // Get line run data
-    const runResult = await client.query("SELECT * FROM line_runs WHERE id = $1", [runId]);
+    const runResult = await client.query("SELECT lr.*, wo.work_order_no FROM line_runs lr LEFT JOIN work_orders wo ON wo.id = lr.work_order_id WHERE lr.id = $1", [runId]);
 
     if (runResult.rows.length === 0) {
       return res.status(404).json({
