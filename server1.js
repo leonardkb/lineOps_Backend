@@ -3993,6 +3993,64 @@ app.get("/api/planning/available-lines", authenticateToken, async (req, res) => 
     client.release();
   }
 });
+/**
+ * GET /api/planning/line-work-orders?line=8&date=YYYY-MM-DD
+ * Work orders the planner assigned to a given line (optional single date),
+ * for the line engineer to pick during line creation (step 1). SAM travels
+ * from the work order (fixed by merchant/planner) as `sam`.
+ * Same join as /api/lineleader/work-orders, but scoped by ?line= not the user.
+ */
+app.get("/api/planning/line-work-orders", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { line, date } = req.query;
+    if (line == null || String(line).trim() === "") {
+      return res.status(400).json({ success: false, error: "line parameter is required" });
+    }
+
+    const params = [String(line)]; // line_assignments.line_no is TEXT
+    let query = `
+      SELECT
+        la.id              AS assignment_id,
+        la.work_order_id,
+        la.line_no,
+        la.assigned_date,
+        la.assigned_quantity,
+        la.planned_start_date,
+        la.planned_end_date,
+        la.priority,
+        la.status          AS assignment_status,
+        wo.work_order_no,
+        wo.customer_name,
+        wo.style_description,
+        wo.style_code,
+        wo.estilo,
+        wo.color,
+        wo.total_to_produce,
+        wo.commitment_date,
+        wo.sam_minutes     AS sam,
+        wo.status          AS work_order_status
+      FROM line_assignments la
+      JOIN work_orders wo ON wo.id = la.work_order_id
+      WHERE la.line_no = $1
+        AND la.status <> 'cancelled'
+    `;
+    if (date) {
+      params.push(date);
+      query += ` AND la.assigned_date = $${params.length}`;
+    }
+    query += ` ORDER BY la.priority DESC, la.assigned_date ASC, la.created_at DESC;`;
+
+    const result = await client.query(query, params);
+    res.json({ success: true, workOrders: result.rows });
+  } catch (err) {
+    console.error("❌ Error fetching planning line work orders:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 /**
  * GET /api/planning/dashboard?date=YYYY-MM-DD
